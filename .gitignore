@@ -1,0 +1,9 @@
+cat << 'EOF' > .gitignore
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+scratch/
+data/raw/*.pdf
+.env
+EOF
