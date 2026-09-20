@@ -3,19 +3,20 @@ r"""
 1. PURPOSE & ROLE:
    - Module: demo.py
    - Role: Interactive Terminal CLI and demonstration runner for TrustRAG.
-   - Purpose: Discovers raw PDF documents in `data/raw/`, orchestrates automatic
-     ingestion and indexing, showcases active LLM provider configuration (Groq, Gemini,
-     Local, or Mock), displays retrieved parent context passages, and executes
-     claim-level NLI verification and automated safety gating.
+   - Purpose: Recursively discovers documents across all subfolders in `data/raw/`,
+     orchestrates automatic collision-safe ingestion and indexing, showcases active
+     LLM provider configuration (Groq, Gemini, Local, or Mock), displays retrieved
+     parent context passages, and executes claim-level NLI verification and automated safety gating.
 
 2. INPUT (IP):
-   - PDF files placed inside the `data/raw/` directory.
+   - Document files placed inside `data/raw/` or any nested subfolder.
    - Interactive user query strings entered via terminal standard input (stdin).
 
 3. PROCESS UNDER THE HOOD:
-   - Scans `data/raw/` directory for `.pdf` files (generates synthetic demo PDF if empty).
+   - Recursively scans `data/raw/` (`Path.rglob("*")`) across supported extensions (.pdf, .docx, .xlsx, .csv, .txt, .jpg, .png).
+   - Computes collision-safe relative doc_ids and folder hierarchy metadata.
    - Identifies and prints active LLM provider (Groq, Gemini, Local HF, or Mock).
-   - Instantiates `TrustRAGPipeline` and ingests all discovered PDF documents.
+   - Instantiates `TrustRAGPipeline` and ingests all discovered documents.
    - Enters interactive command-line evaluation loop (`while True`):
      * Prompts user for natural language queries.
      * Executes `pipeline.ask(query)`.
@@ -104,24 +105,54 @@ def run_cli() -> None:
     raw_dir = Path("data/raw")
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. Discover PDFs in data/raw
-    pdf_files = list(raw_dir.glob("*.pdf"))
-    if not pdf_files:
-        print("\n[Notice] No PDF documents found in 'data/raw/'.")
+    # 2. Recursively discover documents in data/raw across all subfolder depths
+    supported_extensions = {".pdf", ".docx", ".xlsx", ".csv", ".txt", ".jpg", ".png"}
+    discovered_files = []
+
+    for file_path in sorted(raw_dir.rglob("*")):
+        if not file_path.is_file():
+            continue
+
+        try:
+            rel = file_path.relative_to(raw_dir)
+        except ValueError:
+            rel = Path(file_path.name)
+
+        # Ignore hidden system files and hidden directory paths
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+
+        if file_path.suffix.lower() not in supported_extensions:
+            continue
+
+        rel_str = str(rel).replace("\\", "/")
+        rel_stem_str = str(rel.with_suffix("")).replace("\\", "/")
+        doc_id = rel_stem_str
+        folder_hierarchy = [p for p in rel.parent.parts if p and p != "."]
+        discovered_files.append((file_path, doc_id, rel_str, folder_hierarchy))
+
+    if not discovered_files:
+        print("\n[Notice] No supported documents found in 'data/raw/'.")
         print("Generating a sample demonstration document: 'data/raw/sample_hardware_specs.pdf'...")
         sample_file = create_sample_pdf_if_empty(raw_dir)
-        pdf_files = [sample_file]
+        discovered_files = [(sample_file, "sample_hardware_specs", "sample_hardware_specs.pdf", [])]
 
-    print(f"\n[Ingestion] Discovered {len(pdf_files)} document(s) in 'data/raw/'.")
+    print(f"\n[Ingestion] Discovered {len(discovered_files)} document(s) across subfolders in 'data/raw/'.")
 
     # 3. Initialize TrustRAG pipeline
     print("\n[Initializing] Loading models and vector index...")
     pipeline = TrustRAGPipeline()
 
     # 4. Ingest documents
-    for pdf_file in pdf_files:
-        print(f"Ingesting: {pdf_file.name}")
-        pipeline.ingest_pdf(str(pdf_file))
+    for file_path, doc_id, rel_str, folders in discovered_files:
+        if file_path.suffix.lower() == ".pdf":
+            print(f"Ingesting: {file_path.name} (doc_id: '{doc_id}', path: '{rel_str}')")
+            pipeline.ingest_pdf(
+                str(file_path),
+                doc_id=doc_id,
+                relative_path=rel_str,
+                folder_hierarchy=folders,
+            )
 
     print("\n" + "=" * 60)
     print(" System Ready. Type 'quit' or 'exit' to terminate.")

@@ -4,31 +4,35 @@ r"""
    - Module: src/main.py
    - Role: End-to-end System Orchestrator for TrustRAG.
    - Purpose: Coordinates all 4 modular pipelines (Ingestion, Hybrid Retrieval with
-     Dynamic Entity Routing, Citation-Aware Generation, and Claim-Level NLI Verification)
-     into a unified, enterprise-scale, high-assurance RAG engine.
+     Dynamic Entity and Folder Routing, Citation-Aware Generation, and Claim-Level NLI Verification)
+     into a unified, enterprise-scale, high-assurance RAG engine supporting recursive
+     multi-depth subfolder document discovery with collision prevention.
 
 2. INPUT (IP):
-   - Ingestion: pdf_path (str) pointing to PDF documents.
+   - Ingestion: pdf_path (str) or raw_dir (str) pointing to document files or subfolder trees.
    - Querying: user_query (str) representing natural language user questions.
 
 3. PROCESS UNDER THE HOOD:
-   - Ingestion Flow:
-     * Extracts pages via PyMuPDF (`extract_pdf_pages`).
+   - Recursive Ingestion Flow:
+     * Recursively traverses subfolders in `data/raw/` (`Path.rglob("*")`) across supported extensions.
+     * Derives collision-safe relative `doc_id`s (e.g. `legal/2026/nda` and `legal__2026__nda`).
+     * Extracts pages via PyMuPDF (`extract_pdf_pages`) or plain text readers.
      * Structurally chunks pages with breadcrumbs (`[Document: ... | Section: ...]`).
+     * Attaches `relative_path` and `folder_hierarchy` to ChildChunk and ParentChunk payloads.
      * Computes dense vectors and sparse token dictionaries.
-     * Indexes into Qdrant (`child_chunks`) and parent cache (`LocalStore`).
+     * Indexes into Qdrant (`trustrag_enterprise`) and parent cache (`LocalStore`).
      * Rebuilds BM25 inverted index with inherited metadata.
      * Extracts clean candidate entity aliases and tracks `known_doc_ids` and `doc_entity_map`.
    - Query & Audit Flow:
-     * Preprocesses query and extracts target document entity filter if specified.
-     * Rewrites query to focus on pure section topic when scoped to an entity.
+     * Preprocesses query and extracts target document entity and folder domain filters.
+     * Rewrites query to focus on pure section topic when scoped to an entity or subfolder.
      * Executes targeted dense and sparse search in parallel via ThreadPoolExecutor.
      * Fuses ranked lists with Reciprocal Rank Fusion (`apply_rrf`).
      * Cross-Encoder reranks and applies Document-Aware Neighbor Context Expansion.
-     * Generates XML prompt enforcing section taxonomy and verbatim acronym fidelity.
+     * Generates XML prompt enforcing section taxonomy, anti-bundling, and verbatim inventory rules.
      * Synthesizes draft response with active generator backend (Groq, Gemini, HF, Mock).
      * Validates citations and normalizes Unicode/whitespace bracket variants.
-     * Extracts section-anchored atomic claims via `AtomicClaimExtractor` with section fallback.
+     * Extracts section-anchored atomic claims via `AtomicClaimExtractor` with multi-citation splitting.
      * Audits claims against section-scoped premise windows via DeBERTa-v3 and `AuditAdjudicator`.
      * Emits `TrustAuditReport`.
 
@@ -38,8 +42,8 @@ r"""
 
 5. LIBRARIES & DEPENDENCIES:
    - concurrent.futures: Parallel dense/sparse execution.
-   - pathlib.Path: File operations.
-   - re: Regex entity extraction.
+   - pathlib.Path: File operations and recursive directory traversal.
+   - re: Regex entity and folder alias extraction.
    - src.common.config, src.common.schemas: Configurations and schemas.
    - src.pipeline_1_ingestion.*, src.pipeline_2_retrieval.*,
      src.pipeline_3_generation.*, src.pipeline_4_verification.*: Pipeline modules.
@@ -49,7 +53,7 @@ r"""
 import concurrent.futures
 from pathlib import Path
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from src.common.config import config
 from src.common.schemas import ChildChunk, ParentChunk, RetrievalCandidate, TrustAuditReport
@@ -68,6 +72,57 @@ from src.pipeline_3_generation.prompt import build_rag_prompt
 from src.pipeline_4_verification.adjudicator import AuditAdjudicator
 from src.pipeline_4_verification.claim_extractor import AtomicClaimExtractor
 from src.pipeline_4_verification.nli_model import DebertaNLIVerifier
+
+SUPPORTED_DOCUMENT_EXTENSIONS: Set[str] = {
+    ".pdf", ".docx", ".xlsx", ".csv", ".txt", ".jpg", ".png"
+}
+
+
+def discover_raw_documents(
+    raw_dir: Union[str, Path] = "data/raw",
+    supported_extensions: Optional[Set[str]] = None,
+) -> List[Tuple[Path, str, str, List[str]]]:
+    """Recursively discover document files in raw_dir across all subfolder depths.
+
+    Args:
+        raw_dir: Base directory path to scan.
+        supported_extensions: Optional set of allowed file extensions.
+
+    Returns:
+        List of tuples: `(file_path, doc_id, relative_path_str, folder_hierarchy)`.
+    """
+    base_dir = Path(raw_dir)
+    if not base_dir.exists():
+        return []
+
+    exts = supported_extensions or SUPPORTED_DOCUMENT_EXTENSIONS
+    discovered: List[Tuple[Path, str, str, List[str]]] = []
+
+    for file_path in sorted(base_dir.rglob("*")):
+        if not file_path.is_file():
+            continue
+
+        try:
+            rel_path = file_path.relative_to(base_dir)
+        except ValueError:
+            rel_path = Path(file_path.name)
+
+        # Ignore hidden system files and hidden directory segments
+        if any(part.startswith(".") for part in rel_path.parts):
+            continue
+
+        if file_path.suffix.lower() not in exts:
+            continue
+
+        # Derive clean, collision-safe doc_id (e.g., "legal/2026/nda")
+        rel_str = str(rel_path).replace("\\", "/")
+        rel_stem_str = str(rel_path.with_suffix("")).replace("\\", "/")
+        doc_id = rel_stem_str
+        folder_hierarchy = [p for p in rel_path.parent.parts if p and p != "."]
+
+        discovered.append((file_path, doc_id, rel_str, folder_hierarchy))
+
+    return discovered
 
 
 class TrustRAGPipeline:
@@ -129,10 +184,16 @@ class TrustRAGPipeline:
         """Extract candidate person names and document identifier aliases."""
         aliases = set()
 
-        for token in re.split(r"[_ -]+", assigned_doc_id):
+        # Path and token aliases
+        for token in re.split(r"[/\\__ -]+", assigned_doc_id):
             t_clean = token.lower().strip()
             if len(t_clean) >= 3 and t_clean not in self._STOP_ALIASES:
                 aliases.add(t_clean)
+
+        # Also register sanitized double-underscore alias
+        sanitized_doc_id = assigned_doc_id.replace("/", "__").replace("\\", "__").lower()
+        if len(sanitized_doc_id) >= 3 and sanitized_doc_id not in self._STOP_ALIASES:
+            aliases.add(sanitized_doc_id)
 
         if pages:
             first_page_text = pages[0].get("raw_text", "")
@@ -165,12 +226,20 @@ class TrustRAGPipeline:
 
         return list(aliases)
 
-    def ingest_pdf(self, pdf_path: str, doc_id: Optional[str] = None) -> List[ChildChunk]:
+    def ingest_pdf(
+        self,
+        pdf_path: str,
+        doc_id: Optional[str] = None,
+        relative_path: Optional[str] = None,
+        folder_hierarchy: Optional[List[str]] = None,
+    ) -> List[ChildChunk]:
         """Ingest, chunk, embed, and index a PDF document with structural breadcrumbs.
 
         Args:
             pdf_path: File path to the PDF document.
-            doc_id: Optional unique identifier for the document (defaults to filename stem).
+            doc_id: Optional unique identifier for the document (defaults to relative stem).
+            relative_path: Optional full relative subfolder path.
+            folder_hierarchy: Optional list of parent folder categories.
 
         Returns:
             List of indexed ChildChunk models.
@@ -179,7 +248,19 @@ class TrustRAGPipeline:
         if not path.is_file():
             raise FileNotFoundError(f"PDF document not found at: {pdf_path}")
 
-        assigned_doc_id = doc_id or path.stem
+        try:
+            rel = path.relative_to("data/raw")
+            computed_doc_id = str(rel.with_suffix("")).replace("\\", "/")
+            computed_rel_str = str(rel).replace("\\", "/")
+            computed_folders = [p for p in rel.parent.parts if p and p != "."]
+        except (ValueError, Exception):
+            computed_doc_id = path.stem
+            computed_rel_str = path.name
+            computed_folders = []
+
+        assigned_doc_id = doc_id or computed_doc_id
+        doc_rel_path = relative_path or computed_rel_str
+        doc_folders = folder_hierarchy if folder_hierarchy is not None else computed_folders
 
         # Step 1: Extract pages
         pages = extract_pdf_pages(str(path))
@@ -205,6 +286,14 @@ class TrustRAGPipeline:
         if not children:
             return []
 
+        # Attach folder hierarchy & relative paths to chunk metadata
+        for p in parents:
+            p.relative_path = doc_rel_path
+            p.folder_hierarchy = doc_folders
+        for c in children:
+            c.relative_path = doc_rel_path
+            c.folder_hierarchy = doc_folders
+
         # Step 3: Embed Dense and Sparse
         child_texts = [child.text for child in children]
         dense_vectors = self.embedder.embed_dense(child_texts)
@@ -224,8 +313,38 @@ class TrustRAGPipeline:
         # Step 5: Update BM25 Inverted Index
         self.bm25_searcher = BM25Searcher(self.all_child_chunks)
 
-        print(f"Successfully indexed {len(children)} chunks from {path.name}.")
+        print(f"Successfully indexed {len(children)} chunks from {path.name} (doc_id: '{assigned_doc_id}').")
         return children
+
+    def ingest_directory(
+        self,
+        raw_dir: str = "data/raw",
+        supported_extensions: Optional[Set[str]] = None,
+    ) -> List[ChildChunk]:
+        """Recursively discover and ingest all supported document files across subfolders in raw_dir.
+
+        Args:
+            raw_dir: Path to base raw data directory.
+            supported_extensions: Optional set of allowed file extensions.
+
+        Returns:
+            List of all indexed ChildChunk models.
+        """
+        discovered = discover_raw_documents(raw_dir=raw_dir, supported_extensions=supported_extensions)
+        print(f"[Ingestion] Discovered {len(discovered)} document(s) across subfolders in '{raw_dir}'.")
+
+        all_indexed: List[ChildChunk] = []
+        for file_path, doc_id, rel_str, folders in discovered:
+            if file_path.suffix.lower() == ".pdf":
+                chunks = self.ingest_pdf(
+                    str(file_path),
+                    doc_id=doc_id,
+                    relative_path=rel_str,
+                    folder_hierarchy=folders,
+                )
+                all_indexed.extend(chunks)
+
+        return all_indexed
 
     def ask(self, user_query: str) -> TrustAuditReport:
         """Process a user query with dynamic entity routing, neighbor expansion, and NLI verification.

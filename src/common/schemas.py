@@ -47,6 +47,8 @@ class ChildChunk(StrictBaseModel):
     page_number: int
     chunk_index: int = 0
     section_name: str = "General"
+    relative_path: Optional[str] = None
+    folder_hierarchy: Optional[List[str]] = None
 
 
 class ParentChunk(StrictBaseModel):
@@ -58,6 +60,8 @@ class ParentChunk(StrictBaseModel):
     child_ids: List[str] = Field(default_factory=list)
     chunk_index: int = 0
     section_name: str = "General"
+    relative_path: Optional[str] = None
+    folder_hierarchy: Optional[List[str]] = None
 
 
 class RetrievalCandidate(StrictBaseModel):
@@ -70,6 +74,8 @@ class RetrievalCandidate(StrictBaseModel):
     match_type: str
     chunk_index: int = 0
     section_name: str = "General"
+    relative_path: Optional[str] = None
+    folder_hierarchy: Optional[List[str]] = None
 
 
 class GeneratedDraft(StrictBaseModel):

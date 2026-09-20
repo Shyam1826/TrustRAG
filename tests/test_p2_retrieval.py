@@ -252,3 +252,25 @@ def test_dense_searcher_balanced_quota_multi_doc():
     # Ranks must be 1 and 2
     assert [r[1] for r in results] == [1, 2]
 
+
+def test_query_transformer_folder_domain_extraction():
+    """Verify that QueryTransformer extracts folder-based domain filters and strips folder prepositions."""
+    transformer = QueryTransformer()
+    known_docs = ["legal/2026/nda", "legal/2025/agreement", "engineering/specs"]
+
+    # 1. "in legal" query
+    doc_filter, tokens = transformer.extract_doc_filter("What are the agreements in legal?", known_doc_ids=known_docs)
+    assert isinstance(doc_filter, list)
+    assert set(doc_filter) == {"legal/2026/nda", "legal/2025/agreement"}
+    clean_q = transformer.transform("What are the agreements in legal?", entities_to_strip=tokens)
+    assert "agreements" in clean_q
+    assert "legal" not in clean_q
+
+    # 2. "under engineering" query
+    doc_filter_eng, tokens_eng = transformer.extract_doc_filter("Show me the specs under engineering", known_doc_ids=known_docs)
+    assert doc_filter_eng == "engineering/specs"
+    clean_q_eng = transformer.transform("Show me the specs under engineering", entities_to_strip=tokens_eng)
+    assert "specs" in clean_q_eng
+    assert "engineering" not in clean_q_eng
+
+

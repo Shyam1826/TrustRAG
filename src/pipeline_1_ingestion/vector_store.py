@@ -20,17 +20,17 @@ r"""
      (default `path="data/qdrant_db"`), remote URL (`os.getenv("QDRANT_URL")`), or in-memory.
    - Idempotently creates collection `trustrag_enterprise` (384 dimensions, Cosine distance).
    - Generates deterministic RFC 4122 UUIDs (`uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id)`).
-   - Ingests child chunk vectors alongside complete metadata payloads:
-     * `doc_id`, `parent_id`, `child_id`, `section_path`, `child_text`, `parent_text`,
-       `page_number`, `chunk_index`, and `sparse_tokens`.
-   - Executes native Qdrant filtered search using `models.MatchValue` (single string filter)
-     or `models.MatchAny` (multi-doc list filter).
-   - Returns structured point dictionaries with hydrated parent text and similarity scores.
+    - Ingests child chunk vectors alongside complete metadata payloads:
+      * `doc_id`, `parent_id`, `child_id`, `section_path`, `child_text`, `parent_text`,
+        `page_number`, `chunk_index`, `sparse_tokens`, `relative_path`, and `folder_hierarchy`.
+    - Executes native Qdrant filtered search using `models.MatchValue` (single string filter)
+      or `models.MatchAny` (multi-doc list filter).
+    - Returns structured point dictionaries with hydrated parent text and similarity scores.
 
 4. OUTPUT (OP):
    - Ingestion: Persisted points in Qdrant collection and parent chunk cache.
    - Search: list[dict[str, Any]] containing `child_id`, `parent_id`, `doc_id`, `score`,
-     `child_text`, `parent_text`, and metadata payloads.
+     `child_text`, `parent_text`, `relative_path`, `folder_hierarchy`, and metadata payloads.
    - Consumed by: `src/pipeline_2_retrieval/search_dense.py` and `src/main.py`.
 
 5. LIBRARIES & DEPENDENCIES:
@@ -136,6 +136,26 @@ class QdrantVectorStore:
             parent_text = parent.text if parent else getattr(chunk, "text", "")
             section_path = getattr(chunk, "section_name", "General")
 
+            # Resolve relative_path and folder_hierarchy
+            relative_path = getattr(chunk, "relative_path", None)
+            if not relative_path and parent:
+                relative_path = getattr(parent, "relative_path", None)
+            if not relative_path:
+                relative_path = chunk.doc_id
+
+            folder_hierarchy = getattr(chunk, "folder_hierarchy", None)
+            if folder_hierarchy is None and parent:
+                folder_hierarchy = getattr(parent, "folder_hierarchy", None)
+            if folder_hierarchy is None:
+                if "/" in str(relative_path):
+                    parts = str(relative_path).split("/")[:-1]
+                    folder_hierarchy = [p for p in parts if p]
+                elif "__" in str(relative_path):
+                    parts = str(relative_path).split("__")[:-1]
+                    folder_hierarchy = [p for p in parts if p]
+                else:
+                    folder_hierarchy = []
+
             payload = {
                 "doc_id": chunk.doc_id,
                 "parent_id": chunk.parent_id,
@@ -146,6 +166,8 @@ class QdrantVectorStore:
                 "page_number": chunk.page_number,
                 "sparse_tokens": getattr(chunk, "sparse_tokens", None),
                 "chunk_index": getattr(chunk, "chunk_index", 0),
+                "relative_path": relative_path,
+                "folder_hierarchy": folder_hierarchy,
             }
 
             points.append(
@@ -256,6 +278,8 @@ class QdrantVectorStore:
                     "parent_text": payload.get("parent_text", ""),
                     "page_number": payload.get("page_number", 1),
                     "chunk_index": payload.get("chunk_index", 0),
+                    "relative_path": payload.get("relative_path", ""),
+                    "folder_hierarchy": payload.get("folder_hierarchy", []),
                     "payload": payload,
                 }
             )

@@ -27,12 +27,13 @@ r"""
 """
 
 import os
+from pathlib import Path
 import tempfile
 from typing import Generator
 import fitz
 import pytest
 
-from src.main import TrustRAGPipeline
+from src.main import TrustRAGPipeline, discover_raw_documents
 
 
 @pytest.fixture
@@ -79,3 +80,54 @@ def test_trustrag_pipeline_end_to_end(orchestrator_pdf_path: str):
     assert report.has_contradiction is False
     assert report.faithfulness_score >= 0.80
     assert report.action == "PASS"
+
+
+def test_recursive_subfolder_document_discovery():
+    """Verify recursive scanning discovers files across nested subfolders and prevents collision."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+
+        sub_legal_2026 = root / "legal" / "2026"
+        sub_legal_2025 = root / "legal" / "2025"
+        sub_eng = root / "engineering"
+        sub_hidden = root / ".hidden"
+
+        for p in [sub_legal_2026, sub_legal_2025, sub_eng, sub_hidden]:
+            p.mkdir(parents=True, exist_ok=True)
+
+        doc1 = fitz.open()
+        p1 = doc1.new_page()
+        p1.insert_text((50, 72), "Legal NDA 2026 content.")
+        doc1.save(str(sub_legal_2026 / "nda.pdf"))
+        doc1.close()
+
+        doc2 = fitz.open()
+        p2 = doc2.new_page()
+        p2.insert_text((50, 72), "Legal NDA 2025 content.")
+        doc2.save(str(sub_legal_2025 / "nda.pdf"))
+        doc2.close()
+
+        doc3 = fitz.open()
+        p3 = doc3.new_page()
+        p3.insert_text((50, 72), "Engineering specifications content.")
+        doc3.save(str(sub_eng / "specs.pdf"))
+        doc3.close()
+
+        doc4 = fitz.open()
+        p4 = doc4.new_page()
+        p4.insert_text((50, 72), "Hidden content.")
+        doc4.save(str(sub_hidden / "secret.pdf"))
+        doc4.close()
+
+        discovered = discover_raw_documents(raw_dir=root)
+
+        assert len(discovered) == 3
+        doc_ids = {d[1] for d in discovered}
+        assert doc_ids == {"legal/2026/nda", "legal/2025/nda", "engineering/specs"}
+
+        pipeline = TrustRAGPipeline(generator_type="mock")
+        chunks = pipeline.ingest_directory(raw_dir=str(root))
+        assert len(chunks) >= 3
+        assert "legal/2026/nda" in pipeline.known_doc_ids
+        assert "legal/2025/nda" in pipeline.known_doc_ids
+        assert "engineering/specs" in pipeline.known_doc_ids
