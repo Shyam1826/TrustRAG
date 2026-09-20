@@ -179,3 +179,62 @@ def test_atomic_claim_extractor_short_items_and_universal_framing():
     assert "Under Work Experience, the document specifies: Developed automated data analysis pipelines." in claims[2].claim_text
     assert claims[2].cited_doc_id == "Doc-2"
 
+
+def test_multi_citation_atomic_claim_splitting():
+    """Verify that multi-citation lines (e.g. - MongoDB [Doc-1][Doc-2]) split into independent atomic claims."""
+    extractor = AtomicClaimExtractor()
+
+    draft = GeneratedDraft(
+        raw_text=(
+            "### Database Technologies\n"
+            "- MongoDB [Doc-1][Doc-2]\n"
+            "- Microservices architecture [Doc-1] [Doc-3]"
+        ),
+        cited_doc_ids=["Doc-1", "Doc-2", "Doc-3"],
+        citations_valid=True,
+    )
+
+    claims = extractor.extract_claims(draft)
+
+    # 2 citations on line 1 + 2 citations on line 2 = 4 atomic claims
+    assert len(claims) == 4
+
+    # Claims for MongoDB
+    assert "MongoDB" in claims[0].claim_text
+    assert claims[0].cited_doc_id == "Doc-1"
+    assert claims[0].claim_id == "claim_0"
+
+    assert "MongoDB" in claims[1].claim_text
+    assert claims[1].cited_doc_id == "Doc-2"
+    assert claims[1].claim_id == "claim_1"
+
+    # Claims for Microservices architecture
+    assert "Microservices architecture" in claims[2].claim_text
+    assert claims[2].cited_doc_id == "Doc-1"
+    assert claims[2].claim_id == "claim_2"
+
+    assert "Microservices architecture" in claims[3].claim_text
+    assert claims[3].cited_doc_id == "Doc-3"
+    assert claims[3].claim_id == "claim_3"
+
+
+def test_adjudicator_short_token_premise_window():
+    """Verify that premise window extraction searches across complete parent passage for short technical tokens."""
+    adjudicator = AuditAdjudicator()
+
+    context = (
+        "[Document: Doc-1 | Section: Technical Architecture]\n"
+        "Microservices Cluster\n"
+        "• Services communicate via REST APIs and gRPC.\n"
+        "• Data persistence layer is backed by MongoDB and Redis.\n"
+        "• Deployment uses Docker containers orchestrated on AWS ECS."
+    )
+
+    # Short technical token claim
+    claim = "The document specifies: MongoDB."
+    premise_window = adjudicator._extract_premise_window(claim, context)
+
+    assert "MongoDB" in premise_window
+    assert "[Document: Doc-1 | Section: Technical Architecture]" in premise_window
+
+

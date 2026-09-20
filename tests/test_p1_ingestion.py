@@ -1,16 +1,47 @@
-"""Integration and unit tests for Pipeline 1: Ingestion & Hierarchical Indexing."""
+r"""
+================================================================================
+1. PURPOSE & ROLE:
+   - Module: tests/test_p1_ingestion.py
+   - Role: Integration and unit test suite for Pipeline 1 (Ingestion & Storage).
+   - Purpose: Validates PDF layout extraction, text cleaning, hierarchical chunking,
+     dense/sparse embedding generation, persistent QdrantVectorStore operations,
+     native payload filtering, and parent-child metadata hydration.
+
+2. INPUT (IP):
+   - Temporary multi-page PDF documents and synthetic layout blocks.
+
+3. PROCESS UNDER THE HOOD:
+   - Tests `clean_text` hyphenation deconstruction and whitespace normalization.
+   - Tests end-to-end ingestion pipeline with hierarchical chunking and embedding.
+   - Tests `QdrantVectorStore` disk persistence, upsert with complete payloads,
+     and native filtering with `MatchValue` and `MatchAny`.
+   - Tests multi-column layout extraction block ordering in PyMuPDF parser.
+
+4. OUTPUT (OP):
+   - Pytest assertions and validation results.
+
+5. LIBRARIES & DEPENDENCIES:
+   - fitz (PyMuPDF): PDF generation and parsing.
+   - pytest, tempfile, os: Test harness utilities.
+   - src.pipeline_1_ingestion.*: Ingestion modules.
+   - src.common.schemas: ChildChunk, ParentChunk models.
+================================================================================
+"""
 
 import os
+import shutil
 import tempfile
 from typing import Generator
 import fitz  # PyMuPDF
 import pytest
 
+from src.common.schemas import ChildChunk, ParentChunk
 from src.pipeline_1_ingestion.parser import extract_pdf_pages
 from src.pipeline_1_ingestion.cleaner import clean_text
 from src.pipeline_1_ingestion.chunker import create_hierarchical_chunks
 from src.pipeline_1_ingestion.embedder import DualEmbedder
 from src.pipeline_1_ingestion.indexer import LocalStore
+from src.pipeline_1_ingestion.vector_store import QdrantVectorStore
 
 
 @pytest.fixture
@@ -102,13 +133,13 @@ def test_p1_end_to_end_pipeline(sample_pdf_path: str):
         assert isinstance(child.sparse_tokens, dict)
         assert len(child.sparse_tokens) > 0
 
-    # Step 4: Index into LocalStore (in-memory Qdrant + Parent Store)
+    # Step 4: Index into LocalStore (Qdrant + Parent Store)
     store = LocalStore(location=":memory:", vector_size=384)
     store.upsert_child_chunks(children)
     store.store_parents(parents)
 
     # Assert 1: Qdrant collection contains exact number of points
-    point_count = store.client.count(collection_name="child_chunks").count
+    point_count = store.client.count(collection_name=store.collection_name).count
     assert point_count == len(children)
 
     # Assert 2: Querying get_parent returns exact parent passage
@@ -118,6 +149,80 @@ def test_p1_end_to_end_pipeline(sample_pdf_path: str):
         assert retrieved_parent.parent_id == parent.parent_id
         assert retrieved_parent.text == parent.text
         assert retrieved_parent.child_ids == parent.child_ids
+
+
+def test_qdrant_vector_store_persistence_and_filtering():
+    """Verify persistent Qdrant on disk, payload hydration, and native filtering."""
+    temp_dir = tempfile.mkdtemp(prefix="qdrant_test_")
+    try:
+        # 1. Initialize persistent store on disk
+        store = QdrantVectorStore(path=temp_dir, vector_size=384)
+
+        # 2. Prepare sample chunks across two documents
+        parent1 = ParentChunk(
+            parent_id="p_doc1_0",
+            doc_id="doc_alpha",
+            text="[Document: doc_alpha | Section: Architecture]\nBackend microservices use MongoDB and Python.",
+            page_number=1,
+            section_name="Architecture",
+        )
+        parent2 = ParentChunk(
+            parent_id="p_doc2_0",
+            doc_id="doc_beta",
+            text="[Document: doc_beta | Section: Infrastructure]\nContainer orchestration runs on Docker and Kubernetes.",
+            page_number=1,
+            section_name="Infrastructure",
+        )
+        store.store_parents([parent1, parent2])
+
+        dummy_vector1 = [0.1] * 384
+        dummy_vector2 = [0.2] * 384
+
+        child1 = ChildChunk(
+            chunk_id="c_doc1_0",
+            parent_id="p_doc1_0",
+            doc_id="doc_alpha",
+            text="Backend microservices use MongoDB.",
+            page_number=1,
+            vector=dummy_vector1,
+            section_name="Architecture",
+        )
+        child2 = ChildChunk(
+            chunk_id="c_doc2_0",
+            parent_id="p_doc2_0",
+            doc_id="doc_beta",
+            text="Container orchestration runs on Docker.",
+            page_number=1,
+            vector=dummy_vector2,
+            section_name="Infrastructure",
+        )
+        store.upsert_child_chunks([child1, child2])
+
+        # 3. Test global search with parent_text hydration
+        results_all = store.search(query_vector=dummy_vector1, limit=5)
+        assert len(results_all) == 2
+        for res in results_all:
+            assert "child_id" in res
+            assert "parent_id" in res
+            assert "doc_id" in res
+            assert "parent_text" in res
+            assert len(res["parent_text"]) > 0
+
+        # 4. Test single document filter (MatchValue)
+        results_alpha = store.search(query_vector=dummy_vector1, limit=5, doc_filter="doc_alpha")
+        assert len(results_alpha) == 1
+        assert results_alpha[0]["doc_id"] == "doc_alpha"
+        assert results_alpha[0]["child_id"] == "c_doc1_0"
+        assert "MongoDB" in results_alpha[0]["parent_text"]
+
+        # 5. Test multi-document filter (MatchAny)
+        results_multi = store.search(query_vector=dummy_vector1, limit=5, doc_filter=["doc_alpha", "doc_beta"])
+        assert len(results_multi) == 2
+        doc_ids = {r["doc_id"] for r in results_multi}
+        assert doc_ids == {"doc_alpha", "doc_beta"}
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def test_parser_multi_column_block_ordering():

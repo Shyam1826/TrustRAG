@@ -103,10 +103,41 @@ class AuditAdjudicator:
         breadcrumb = lines[0] if lines and lines[0].startswith("[Document:") else ""
 
         # Extract core content keywords from claim, stripping structural/framing prefixes
-        clean_claim = re.sub(r"^Under\s+[^,:]+[,:]\s*(?:the\s+(?:candidate|document|specification|item|technologies)\s+(?:completed|specifies|states|utilizes|features|include|utilized\s+include):?\s*)?", "", claim_text, flags=re.IGNORECASE)
-        clean_claim = re.sub(r"^The\s+(?:document\s+specifies|technologies\s+utilized\s+include):?\s*", "", clean_claim, flags=re.IGNORECASE)
-        clean_claim = clean_claim.replace("—", " - ").replace("–", " - ").replace("\u2011", "-")
-        claim_words = set(re.findall(r"\b\w{3,}\b", clean_claim.lower()))
+        clean_claim = re.sub(
+            r"^Under\s+[^,:]+[,:]\s*(?:the\s+(?:candidate|document|specification|item|technologies)\s+(?:completed|specifies|states|utilizes|features|include|utilized\s+include|documented\s+specification\s+or\s+item\s+is|documented\s+items\s+include):?\s*)?",
+            "",
+            claim_text,
+            flags=re.IGNORECASE,
+        )
+        clean_claim = re.sub(
+            r"^The\s+(?:document\s+specifies|technologies\s+utilized\s+include):?\s*",
+            "",
+            clean_claim,
+            flags=re.IGNORECASE,
+        )
+        clean_claim = clean_claim.replace("—", " - ").replace("–", " - ").replace("\u2011", "-").strip().rstrip(".")
+        claim_words = set(re.findall(r"\b[\w+#.-]{2,}\b", clean_claim.lower()))
+
+        # For compact parent contexts (<= 1500 chars), return the full parent context directly
+        if len(norm_context) <= 1500:
+            return norm_context
+
+        # For short technical tokens or entity names (e.g. MongoDB, Docker, Python)
+        # ensure premise search scans across the complete parent chunk text without penalization
+        is_short_term = len(clean_claim.split()) <= 3
+        if is_short_term and claim_words:
+            # If all/any claim tokens appear in the parent chunk, prioritize windows containing the token
+            norm_lower = norm_context.lower()
+            if any(w in norm_lower for w in claim_words):
+                # Search across windows containing the term
+                body_lines = lines[1:] if breadcrumb else lines
+                matching_lines = [l for l in body_lines if any(w in l.lower() for w in claim_words)]
+                if matching_lines:
+                    selected_window = "\n".join(matching_lines)
+                    if breadcrumb and not selected_window.startswith("[Document:"):
+                        return f"{breadcrumb}\n{selected_window}"
+                    return selected_window
+                return norm_context
 
         body_lines = lines[1:] if breadcrumb else lines
 
@@ -144,7 +175,7 @@ class AuditAdjudicator:
         best_window = norm_context
 
         for win in windows:
-            win_words = set(re.findall(r"\b\w{3,}\b", win.lower()))
+            win_words = set(re.findall(r"\b[\w+#.-]{2,}\b", win.lower()))
             if not win_words:
                 continue
             overlap = len(claim_words & win_words)
@@ -156,7 +187,12 @@ class AuditAdjudicator:
                 best_score = score
                 best_window = win
 
-        return f"{breadcrumb}\n{best_window}" if breadcrumb else best_window
+        if best_score <= 0:
+            return norm_context
+
+        if breadcrumb and not best_window.startswith("[Document:"):
+            return f"{breadcrumb}\n{best_window}"
+        return best_window
 
     def adjudicate(
         self,

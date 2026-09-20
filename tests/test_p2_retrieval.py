@@ -33,8 +33,9 @@ from src.common.schemas import ChildChunk, ParentChunk
 from src.pipeline_1_ingestion.chunker import create_hierarchical_chunks
 from src.pipeline_1_ingestion.embedder import DualEmbedder
 from src.pipeline_1_ingestion.indexer import LocalStore
+from src.pipeline_1_ingestion.vector_store import QdrantVectorStore
 from src.pipeline_2_retrieval.rewriter import QueryTransformer
-from src.pipeline_2_retrieval.search_dense import retrieve_dense
+from src.pipeline_2_retrieval.search_dense import DenseSearcher, retrieve_dense
 from src.pipeline_2_retrieval.search_sparse import BM25Searcher
 from src.pipeline_2_retrieval.fusion import apply_rrf
 from src.pipeline_2_retrieval.reranker import CrossEncoderReranker
@@ -217,3 +218,37 @@ def test_p2_end_to_end_retrieval_and_reranking():
     assert top_candidate.doc_id == "doc_1"
     assert "125W TDP" in top_candidate.text
     assert "Model-X processor" in top_candidate.text
+
+
+def test_dense_searcher_balanced_quota_multi_doc():
+    """Verify DenseSearcher enforces balanced retrieval quotas and deduplication by parent_id."""
+    store = QdrantVectorStore(location=":memory:", vector_size=384)
+    embedder = DualEmbedder()
+
+    # Create multiple child chunks under the same parent for doc_a and doc_b
+    p_a = ParentChunk(parent_id="pa_1", doc_id="doc_a", text="Parent context doc_a with MongoDB", page_number=1, section_name="Skills")
+    p_b = ParentChunk(parent_id="pb_1", doc_id="doc_b", text="Parent context doc_b with PostgreSQL", page_number=1, section_name="Skills")
+    store.store_parents([p_a, p_b])
+
+    ca_1 = ChildChunk(chunk_id="ca_1", parent_id="pa_1", doc_id="doc_a", text="Database MongoDB", page_number=1, vector=embedder.embed_dense(["Database MongoDB"])[0])
+    ca_2 = ChildChunk(chunk_id="ca_2", parent_id="pa_1", doc_id="doc_a", text="MongoDB queries", page_number=1, vector=embedder.embed_dense(["MongoDB queries"])[0])
+    cb_1 = ChildChunk(chunk_id="cb_1", parent_id="pb_1", doc_id="doc_b", text="Database PostgreSQL", page_number=1, vector=embedder.embed_dense(["Database PostgreSQL"])[0])
+    cb_2 = ChildChunk(chunk_id="cb_2", parent_id="pb_1", doc_id="doc_b", text="PostgreSQL schemas", page_number=1, vector=embedder.embed_dense(["PostgreSQL schemas"])[0])
+
+    store.upsert_child_chunks([ca_1, ca_2, cb_1, cb_2])
+
+    searcher = DenseSearcher(vector_store=store, embedder=embedder)
+    results = searcher.search(
+        query_text="Databases",
+        top_k=4,
+        doc_filter=["doc_a", "doc_b"],
+    )
+
+    # Balanced search deduplicates by parent_id, so only 1 chunk per unique parent is emitted
+    assert len(results) == 2
+    cids = [cid for cid, rank, score in results]
+    assert "ca_1" in cids or "ca_2" in cids
+    assert "cb_1" in cids or "cb_2" in cids
+    # Ranks must be 1 and 2
+    assert [r[1] for r in results] == [1, 2]
+

@@ -75,6 +75,7 @@ def test_build_rag_prompt_structure():
     # Assert operational rules
     assert "Strict Semantic Grounding & Closed-World Assumption" in prompt
     assert "Strict Attribute Isolation & Anti-Bundle Enforcement" in prompt
+    assert "Strict Inventory & Entity Grounding" in prompt
     assert "ASCII Inline Citations" in prompt
     assert "Insufficient Evidence" in prompt
 

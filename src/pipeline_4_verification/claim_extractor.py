@@ -2,12 +2,12 @@ r"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_4_verification/claim_extractor.py
-   - Role: Domain-agnostic proposition and atomic claim extraction engine with section context.
+   - Role: Domain-agnostic proposition and multi-citation atomic claim extraction engine.
    - Purpose: Deconstructs synthesized draft responses into complete, standalone
      verifiable propositions across any domain (resumes, technical specifications, legal contracts,
      financial filings, API documentation). Standardizes Unicode brackets, dashes, and whitespace,
-     anchors short list items and specifications with active section headers, and associates
-     each claim with its cited document handle for NLI auditing.
+     anchors short list items with active section headers, and performs multi-citation atomic
+     splitting (generating an independent claim for every cited [Doc-X] handle) for NLI auditing.
 
 2. INPUT (IP):
    - draft (GeneratedDraft): Synthesized draft model from `src/pipeline_3_generation/`.
@@ -18,14 +18,18 @@ r"""
      (`—`, `–`, `\u2011` -> `'-'`), and Unicode brackets (`【` -> `[`, `】` -> `]`).
    - Step 2: Identifies structural section headings, tracking `current_section`.
    - Step 3: Skips heading and fallback lines so they are not treated as atomic assertions.
-   - Step 4: Discovers inline citation tags (e.g., `[Doc-1]`).
-   - Step 5: For short specifications or 1-2 word list items (e.g. "AutoCad", "15W", "Python"),
-     anchors with section scope (`Under {section}, the documented specification or item is: {item}.`).
+   - Step 4: Discovers all inline citation tags (e.g., `[Doc-1]`, `[Doc-2]`) per line.
+   - Step 5: For short specifications or 1-2 word list items (e.g. "AutoCad", "15W", "Python", "MongoDB"),
+     anchors with section scope (`Under {section}, the documented specification or item is: {item}.`
+     or `The document specifies: {item}.`).
    - Step 6: For technology, feature, or specification lists, anchors with domain-neutral prefixes.
-   - Step 7: Emits `AtomicClaim` models with sequential IDs (`claim_0`, `claim_1`, ...).
+   - Step 7: Multi-Citation Atomic Splitting:
+     * If a line contains multiple citations (e.g. `- MongoDB [Doc-1][Doc-2]`), generates an
+       independent `AtomicClaim` for EACH cited document handle (`Doc-1`, `Doc-2`).
+   - Step 8: Emits `AtomicClaim` models with sequential IDs (`claim_0`, `claim_1`, ...).
 
 4. OUTPUT (OP):
-   - list[AtomicClaim]: Complete, section-anchored grammatical proposition models.
+   - list[AtomicClaim]: Complete, multi-citation split grammatical proposition models.
    - Consumed by: `src/pipeline_4_verification/adjudicator.py`.
 
 5. LIBRARIES & DEPENDENCIES:
@@ -90,15 +94,14 @@ class AtomicClaimExtractor:
             if not line_str:
                 continue
 
-            # Extract citations from line
+            # Extract all citations from line
             citation_matches = self._CITATION_REGEX.findall(line_str)
-            cited_doc_id: Optional[str] = citation_matches[0] if citation_matches else None
 
             # Check if line is purely a section header or item title
             is_header = False
-            if line_str.startswith("#") or (line_str.startswith("**") and line_str.endswith("**") and not cited_doc_id) or (line_str.endswith(":") and len(line_str.split()) <= 6 and not cited_doc_id):
+            if line_str.startswith("#") or (line_str.startswith("**") and line_str.endswith("**") and not citation_matches) or (line_str.endswith(":") and len(line_str.split()) <= 6 and not citation_matches):
                 is_header = True
-            elif not line_str.startswith(("-", "*", "•")) and not any(line_str.startswith(f"{c}.") for c in range(10)) and not cited_doc_id and len(line_str.split()) <= 6:
+            elif not line_str.startswith(("-", "*", "•")) and not any(line_str.startswith(f"{c}.") for c in range(10)) and not citation_matches and len(line_str.split()) <= 6:
                 is_header = True
 
             if is_header:
@@ -123,15 +126,15 @@ class AtomicClaimExtractor:
 
             # Universal proposition framing
             if len(tokens) < 3:
-                # 1-2 word items or specifications (e.g., "AutoCad", "15W", "Python", "GDPR")
+                # 1-2 word items or specifications (e.g., "AutoCad", "15W", "Python", "MongoDB", "Docker")
                 if sec_label and sec_label.lower() != "general":
                     anchored_claim = f"Under {sec_label}, the documented specification or item is: {clean_claim}."
                 else:
                     anchored_claim = f"The document specifies: {clean_claim}."
             else:
                 # 3+ tokens
-                if clean_claim.lower().startswith(("tech stack:", "technologies:", "tools:", "features:", "specifications:", "specs:", "skills:")):
-                    body = re.sub(r"^(?:tech stack|technologies|tools|features|specifications|specs|skills):\s*", "", clean_claim, flags=re.IGNORECASE).strip()
+                if clean_claim.lower().startswith(("tech stack:", "technologies:", "tools:", "features:", "specifications:", "specs:", "skills:", "databases:", "platforms:", "languages:")):
+                    body = re.sub(r"^(?:tech stack|technologies|tools|features|specifications|specs|skills|databases|platforms|languages):\s*", "", clean_claim, flags=re.IGNORECASE).strip()
                     if sec_label and sec_label.lower() != "general":
                         anchored_claim = f"Under {sec_label}, the documented items include: {body}"
                     else:
@@ -146,18 +149,31 @@ class AtomicClaimExtractor:
                     else:
                         anchored_claim = clean_claim
 
-
             if not anchored_claim.endswith("."):
                 anchored_claim += "."
 
-            claim_id = f"claim_{claim_counter}"
-            claims.append(
-                AtomicClaim(
-                    claim_id=claim_id,
-                    claim_text=anchored_claim,
-                    cited_doc_id=cited_doc_id,
+            # Multi-Citation Atomic Splitting: Emit an independent claim for EACH cited document handle
+            if citation_matches:
+                for doc_tag in citation_matches:
+                    claim_id = f"claim_{claim_counter}"
+                    claims.append(
+                        AtomicClaim(
+                            claim_id=claim_id,
+                            claim_text=anchored_claim,
+                            cited_doc_id=doc_tag,
+                        )
+                    )
+                    claim_counter += 1
+            else:
+                claim_id = f"claim_{claim_counter}"
+                claims.append(
+                    AtomicClaim(
+                        claim_id=claim_id,
+                        claim_text=anchored_claim,
+                        cited_doc_id=None,
+                    )
                 )
-            )
-            claim_counter += 1
+                claim_counter += 1
 
         return claims
+
