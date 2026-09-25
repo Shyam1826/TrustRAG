@@ -4,8 +4,8 @@ r"""
    - Module: src/pipeline_3_generation/citation_check.py
    - Role: Citation validation and Unicode normalization engine.
    - Purpose: Parses inline citation tags, standardizes Unicode/full-width bracket
-     variations (e.g., `【Doc-1】` -> `[Doc-1]`), normalizes non-breaking whitespace
-     (`\u202f`, `\xa0`), validates document index bounds against retrieved context set,
+     variations (e.g., `【Doc-1】`, `［Doc-1］`, `［1］` -> `[Doc-1]`), normalizes non-breaking
+     whitespace (`\u202f`, `\xa0`), validates document index bounds against retrieved context set,
      and creates strictly typed `GeneratedDraft` objects.
 
 2. INPUT (IP):
@@ -13,9 +13,10 @@ r"""
    - max_valid_doc_id (int): Total number of valid candidate documents supplied in the prompt.
 
 3. PROCESS UNDER THE HOOD:
-   - Step 1: Normalizes non-breaking and narrow whitespace (`\u202f`, `\xa0` -> `' '`).
-   - Step 2: Normalizes full-width and Unicode brackets (`【` -> `[`, `】` -> `]`).
-   - Step 3: Normalizes citation handle variations (`[Doc 1]`, `[Doc:1]`, `[doc_1]` -> `[Doc-1]`).
+   - Step 1: Applies canonical Unicode NFKC normalization (`unicodedata.normalize('NFKC', draft_text)`).
+   - Step 2: Normalizes non-breaking and narrow whitespace (`\u202f`, `\xa0` -> `' '`).
+   - Step 3: Canonicalizes citation tag variations (`[1]`, `[Doc 1]`, `[Doc:1]`, `[doc_1]`, `【Doc-1】`)
+     into standard `[Doc-X]` format via generalized regex `r"\[\s*(?:Doc[\s:_-]*)?(\d+)\s*\]"`.
    - Step 4: Discovers all inline document references via `r'\[Doc-(\d+)\]'`.
    - Step 5: Validates that every extracted index satisfies: `1 <= doc_index <= max_valid_doc_id`.
    - Step 6: If any citation references an index `< 1` or `> max_valid_doc_id`, marks `citations_valid=False`.
@@ -31,11 +32,13 @@ r"""
 
 5. LIBRARIES & DEPENDENCIES:
    - re: Standard library for regular expression normalization and extraction.
+   - unicodedata: Standard library for canonical NFKC Unicode normalization.
    - src.common.schemas.GeneratedDraft: Typed data contract for generated drafts.
 ================================================================================
 """
 
 import re
+import unicodedata
 from typing import List, Set
 from src.common.schemas import GeneratedDraft
 
@@ -57,14 +60,36 @@ def validate_and_parse_citations(draft_text: str, max_valid_doc_id: int) -> Gene
             citations_valid=True,
         )
 
-    # 1. Normalize non-breaking and narrow whitespace
-    normalized = draft_text.replace("\u202f", " ").replace("\xa0", " ")
-    # 2. Normalize Unicode and full-width bracket variants
-    normalized = normalized.replace("【", "[").replace("】", "]")
-    # 3. Normalize separator and spacing variations like [ Doc: 1 ], [Doc 1], [doc_1] to canonical [Doc-1]
-    normalized = re.sub(r"\[\s*Doc[\s:_-]*(\d+)\s*\]", r"[Doc-\1]", normalized, flags=re.IGNORECASE)
+    # 1. Apply canonical Unicode NFKC normalization (automatically converts Asian fullwidth brackets, numbers, and symbols)
+    normalized = unicodedata.normalize("NFKC", draft_text)
 
-    # 4. Find all occurrences of canonical [Doc-X]
+    # 2. Normalize non-breaking and narrow whitespace
+    normalized = normalized.replace("\u202f", " ").replace("\xa0", " ")
+
+    # 3. Normalize all Asian and Unicode bracket variants
+    normalized = (
+        normalized.replace("【", "[")
+        .replace("】", "]")
+        .replace("〔", "[")
+        .replace("〕", "]")
+        .replace("〖", "[")
+        .replace("〗", "]")
+        .replace("〘", "[")
+        .replace("〙", "]")
+    )
+
+    # 4. Expand composite multi-citation brackets ([Doc-1, Doc-2], [1, 2]) and normalize to [Doc-X]
+    def _expand_bracket(match: re.Match) -> str:
+        inner = match.group(1)
+        digits = re.findall(r"(?:Doc[\s:_-]*)?(\d+)", inner, flags=re.IGNORECASE)
+        if digits:
+            return "".join(f"[Doc-{d}]" for d in digits)
+        return match.group(0)
+
+    normalized = re.sub(r"\[([^\]\n]+)\]", _expand_bracket, normalized)
+    normalized = re.sub(r"\[\s*(?:Doc[\s:_-]*)?(\d+)\s*\]", r"[Doc-\1]", normalized, flags=re.IGNORECASE)
+
+    # 5. Find all occurrences of canonical [Doc-X]
     matches = re.findall(r"\[Doc-(\d+)\]", normalized)
 
     citations_valid = True

@@ -2,12 +2,14 @@ r"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_2_retrieval/search_sparse.py
-   - Role: Lexical/sparse search engine with metadata pre-filtering.
+   - Role: Lexical/sparse search engine with metadata pre-filtering and dynamic re-indexing.
    - Purpose: Implements BM25Okapi scoring across child chunks to capture exact keyword,
-     technical term, and number matches, supporting document-level entity pre-filtering.
+     technical term, and number matches, supporting document-level entity pre-filtering
+     and dynamic inverted index updates upon startup state hydration.
 
 2. INPUT (IP):
-   - Initialization: chunks (list[ChildChunk]) from `src/pipeline_1_ingestion/chunker.py`.
+   - Initialization/Re-indexing: chunks (list[ChildChunk]) from `src/pipeline_1_ingestion/chunker.py`
+     or `src/pipeline_1_ingestion/vector_store.py`.
    - Search: query_tokens (list[str]) representing tokenized query keywords.
    - top_k (int): Number of top lexical matches to retrieve (default 20).
    - doc_filter (str, optional): Target document ID to isolate search to.
@@ -15,6 +17,7 @@ r"""
 3. PROCESS UNDER THE HOOD:
    - Tokenizes child chunks into lowercase word tokens (`re.findall(r'\b\w+\b', chunk.text.lower())`).
    - Builds inverted index structures and document frequency stats via `rank_bm25.BM25Okapi`.
+   - `index_documents(chunks)`: Dynamically rebuilds BM25 inverted index structures.
    - On search:
      * Evaluates BM25 scores across the indexed corpus.
      * If `doc_filter` is specified, filters out chunks belonging to other documents.
@@ -54,6 +57,20 @@ class BM25Searcher:
         # Tokenize corpus for BM25Okapi
         self.corpus_tokens = [self._tokenize(chunk.text) for chunk in chunks]
 
+        if self.corpus_tokens:
+            self.bm25 = BM25Okapi(self.corpus_tokens)
+        else:
+            self.bm25 = None
+
+    def index_documents(self, chunks: List[ChildChunk]) -> None:
+        """Rebuild inverted index from a new list of ChildChunk objects.
+
+        Args:
+            chunks: Updated list of ChildChunk instances.
+        """
+        self.chunks = chunks
+        self.chunk_ids = [chunk.chunk_id for chunk in chunks]
+        self.corpus_tokens = [self._tokenize(chunk.text) for chunk in chunks]
         if self.corpus_tokens:
             self.bm25 = BM25Okapi(self.corpus_tokens)
         else:

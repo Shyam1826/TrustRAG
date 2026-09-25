@@ -2,10 +2,11 @@ r"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_3_generation/generator.py
-   - Role: Multi-provider synthesis and generation engine.
+   - Role: Multi-provider synthesis and generation engine with automatic rate-limit resilience.
    - Purpose: Dispatches structured RAG prompts to cloud API providers (Groq, Gemini),
      local transformers (HuggingFace), or offline deterministic mocks with graceful
-     credential fallback.
+     credential fallback. Implements exponential/adaptive backoff retry loops on HTTP 429
+     (Rate Limit / TPM Exceeded) to ensure multi-turn self-correction completes reliably.
 
 2. INPUT (IP):
    - prompt (str): Formatted RAG prompt containing XML context from `src/pipeline_3_generation/prompt.py`.
@@ -16,9 +17,12 @@ r"""
      * Dispatches HTTP POST to `https://api.groq.com/openai/v1/chat/completions`.
      * Passes system instructions enforcing closed-world rules and inline [Doc-X] citations.
      * Enforces `temperature=0.0` for deterministic, grounded outputs.
+     * Catches HTTP 429 errors, parses recommended wait time from JSON body, and sleeps
+       automatically for up to `max_retries=3`.
    - GeminiGenerator:
      * Dispatches HTTP POST to Google Generative Language API (`/v1beta/models/{model}:generateContent`).
      * Sets `temperature=0.0`.
+     * Includes retry backoff on 429 quota exhaustion.
    - MockGenerator:
      * Offline deterministic rule-based generator for testing without cloud credentials.
    - get_generator:
@@ -31,13 +35,15 @@ r"""
    - Consumed by: `src/pipeline_3_generation/citation_check.py` and `src/pipeline_4_verification/`.
 
 5. LIBRARIES & DEPENDENCIES:
-   - urllib.request, urllib.error, json: Standard library HTTP client for zero-dependency API calls.
+   - urllib.request, urllib.error, json, time, re: Standard library HTTP client, timing, and parsing.
    - abc (ABC, abstractmethod): Abstract base class definitions.
    - src.common.config: Provides generator provider selection, API keys, and model names.
 ================================================================================
 """
 
 import json
+import re
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -64,7 +70,7 @@ class BaseGenerator(ABC):
 
 
 class GroqGenerator(BaseGenerator):
-    """Cloud LLM generator using Groq's high-speed inference API (Llama-3, etc.)."""
+    """Cloud LLM generator using Groq's high-speed inference API with adaptive 429 retries."""
 
     ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -72,17 +78,19 @@ class GroqGenerator(BaseGenerator):
         self,
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
-        timeout: int = 30,
+        timeout: int = 45,
+        max_retries: int = 3,
     ) -> None:
         self.api_key = api_key or config.GROQ_API_KEY
         self.model_name = model_name or config.GROQ_MODEL
         self.timeout = timeout
+        self.max_retries = max_retries
 
         if not self.api_key:
             raise ValueError("GROQ_API_KEY is required for GroqGenerator.")
 
     def generate(self, prompt: str) -> str:
-        """Invoke Groq Chat Completions API with temperature=0.0."""
+        """Invoke Groq Chat Completions API with temperature=0.0 and adaptive 429 backoff."""
         payload = {
             "model": self.model_name,
             "messages": [
@@ -106,42 +114,68 @@ class GroqGenerator(BaseGenerator):
             "User-Agent": "TrustRAG/1.0",
         }
 
-        req = urllib.request.Request(
-            self.ENDPOINT,
-            data=data_bytes,
-            headers=headers,
-            method="POST",
-        )
+        for attempt in range(self.max_retries + 1):
+            req = urllib.request.Request(
+                self.ENDPOINT,
+                data=data_bytes,
+                headers=headers,
+                method="POST",
+            )
 
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                response_data = json.loads(resp.read().decode("utf-8"))
-                return response_data["choices"][0]["message"]["content"].strip()
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Groq API error ({e.code}): {error_body}") from e
-        except Exception as e:
-            raise RuntimeError(f"Failed to communicate with Groq API: {e}") from e
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    response_data = json.loads(resp.read().decode("utf-8"))
+                    return response_data["choices"][0]["message"]["content"].strip()
+
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="replace")
+
+                # Handle Rate Limits (TPM/RPM 429) gracefully
+                if e.code == 429 and attempt < self.max_retries:
+                    wait_seconds = 14.0  # sensible default for Groq TPM resets
+                    try:
+                        err_json = json.loads(error_body)
+                        msg = err_json.get("error", {}).get("message", "")
+                        match = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", msg)
+                        if match:
+                            wait_seconds = float(match.group(1)) + 1.0  # add 1s safety buffer
+                    except Exception:
+                        pass
+
+                    print(
+                        f"\n[RateLimit] Groq TPM limit reached (Attempt {attempt + 1}/{self.max_retries}). "
+                        f"Pausing {wait_seconds:.1f}s before automatic retry..."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                raise RuntimeError(f"Groq API error ({e.code}): {error_body}") from e
+            except Exception as e:
+                raise RuntimeError(f"Failed to communicate with Groq API: {e}") from e
+
+        return FALLBACK_INSUFFICIENT_INFO
 
 
 class GeminiGenerator(BaseGenerator):
-    """Cloud LLM generator using Google Generative Language API (Gemini-1.5, etc.)."""
+    """Cloud LLM generator using Google Generative Language API with 429 backoff."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
-        timeout: int = 30,
+        timeout: int = 45,
+        max_retries: int = 3,
     ) -> None:
         self.api_key = api_key or config.GEMINI_API_KEY
         self.model_name = model_name or config.GEMINI_MODEL
         self.timeout = timeout
+        self.max_retries = max_retries
 
         if not self.api_key:
             raise ValueError("GEMINI_API_KEY is required for GeminiGenerator.")
 
     def generate(self, prompt: str) -> str:
-        """Invoke Google Generative Language API with temperature=0.0."""
+        """Invoke Google Generative Language API with temperature=0.0 and retry backoff."""
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.model_name}:generateContent?key={self.api_key}"
@@ -164,28 +198,41 @@ class GeminiGenerator(BaseGenerator):
             "User-Agent": "TrustRAG/1.0",
         }
 
-        req = urllib.request.Request(
-            url,
-            data=data_bytes,
-            headers=headers,
-            method="POST",
-        )
+        for attempt in range(self.max_retries + 1):
+            req = urllib.request.Request(
+                url,
+                data=data_bytes,
+                headers=headers,
+                method="POST",
+            )
 
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                response_data = json.loads(resp.read().decode("utf-8"))
-                candidates = response_data.get("candidates", [])
-                if not candidates:
-                    return FALLBACK_INSUFFICIENT_INFO
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if not parts:
-                    return FALLBACK_INSUFFICIENT_INFO
-                return parts[0].get("text", "").strip()
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Gemini API error ({e.code}): {error_body}") from e
-        except Exception as e:
-            raise RuntimeError(f"Failed to communicate with Gemini API: {e}") from e
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    response_data = json.loads(resp.read().decode("utf-8"))
+                    candidates = response_data.get("candidates", [])
+                    if not candidates:
+                        return FALLBACK_INSUFFICIENT_INFO
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if not parts:
+                        return FALLBACK_INSUFFICIENT_INFO
+                    return parts[0].get("text", "").strip()
+
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="replace")
+                if e.code == 429 and attempt < self.max_retries:
+                    wait_seconds = 10.0 * (attempt + 1)
+                    print(
+                        f"\n[RateLimit] Gemini rate limit reached (Attempt {attempt + 1}/{self.max_retries}). "
+                        f"Pausing {wait_seconds:.1f}s before retry..."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                raise RuntimeError(f"Gemini API error ({e.code}): {error_body}") from e
+            except Exception as e:
+                raise RuntimeError(f"Failed to communicate with Gemini API: {e}") from e
+
+        return FALLBACK_INSUFFICIENT_INFO
 
 
 class MockGenerator(BaseGenerator):

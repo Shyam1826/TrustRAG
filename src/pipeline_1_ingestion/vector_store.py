@@ -2,16 +2,18 @@ r"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_1_ingestion/vector_store.py
-   - Role: Persistent enterprise vector store and parent-child metadata storage engine.
+   - Role: Persistent enterprise vector store, point management, and parent-child metadata storage engine.
    - Purpose: Manages persistent disk-based or remote Qdrant vector database collections,
-     stores dense child chunk embeddings with hydrated parent payloads, and executes
-     native Qdrant payload-filtered nearest-neighbor vector similarity searches.
+     stores dense child chunk embeddings with hydrated parent payloads, performs document-level
+     point deletions for incremental updates, hydrates child and parent chunks during startup
+     via scroll pagination, and executes native Qdrant payload-filtered nearest-neighbor searches.
 
 2. INPUT (IP):
    - chunks (list[ChildChunk]): Embedder-enriched ChildChunk models with dense vectors and metadata.
    - parents (list[ParentChunk], optional): Coarse context ParentChunk models.
    - query_vector (list[float]): 384-dimensional query embedding vector for search.
    - doc_filter (str or list[str], optional): Document ID(s) to constrain search space.
+   - doc_id (str): Target document ID to delete.
    - Source: `src/pipeline_1_ingestion/chunker.py`, `src/pipeline_1_ingestion/embedder.py`,
      and `src/pipeline_2_retrieval/search_dense.py`.
 
@@ -20,15 +22,20 @@ r"""
      (default `path="data/qdrant_db"`), remote URL (`os.getenv("QDRANT_URL")`), or in-memory.
    - Idempotently creates collection `trustrag_enterprise` (384 dimensions, Cosine distance).
    - Generates deterministic RFC 4122 UUIDs (`uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id)`).
-    - Ingests child chunk vectors alongside complete metadata payloads:
-      * `doc_id`, `parent_id`, `child_id`, `section_path`, `child_text`, `parent_text`,
-        `page_number`, `chunk_index`, `sparse_tokens`, `relative_path`, and `folder_hierarchy`.
-    - Executes native Qdrant filtered search using `models.MatchValue` (single string filter)
-      or `models.MatchAny` (multi-doc list filter).
-    - Returns structured point dictionaries with hydrated parent text and similarity scores.
+   - Ingests child chunk vectors alongside complete metadata payloads:
+     * `doc_id`, `parent_id`, `child_id`, `section_path`, `child_text`, `parent_text`,
+       `page_number`, `chunk_index`, `sparse_tokens`, `relative_path`, and `folder_hierarchy`.
+   - `load_all_child_chunks()`: Scrolls all indexed points from Qdrant collection, reconstructs
+     `ChildChunk` models, hydrates internal parent store cache, and returns complete list of chunks.
+   - `delete_document(doc_id)`: Deletes all points matching `doc_id` from Qdrant collection
+     and clears associated parents from local cache.
+   - Executes native Qdrant filtered search using `models.MatchValue` or `models.MatchAny`.
+   - Returns structured point dictionaries with hydrated parent text and similarity scores.
 
 4. OUTPUT (OP):
    - Ingestion: Persisted points in Qdrant collection and parent chunk cache.
+   - Hydration: list[ChildChunk] for startup state reconstruction and BM25 index re-fitting.
+   - Deletion: Removed points and cache eviction.
    - Search: list[dict[str, Any]] containing `child_id`, `parent_id`, `doc_id`, `score`,
      `child_text`, `parent_text`, `relative_path`, `folder_hierarchy`, and metadata payloads.
    - Consumed by: `src/pipeline_2_retrieval/search_dense.py` and `src/main.py`.
@@ -52,7 +59,7 @@ from src.common.schemas import ChildChunk, ParentChunk
 
 
 class QdrantVectorStore:
-    """Manages dense vector indexing and native payload-filtered retrieval in Qdrant."""
+    """Manages dense vector indexing, startup state hydration, and native payload-filtered retrieval in Qdrant."""
 
     def __init__(
         self,
@@ -88,7 +95,13 @@ class QdrantVectorStore:
         else:
             db_path = path or "data/qdrant_db"
             os.makedirs(db_path, exist_ok=True)
-            self.client = QdrantClient(path=db_path)
+            try:
+                self.client = QdrantClient(path=db_path)
+            except RuntimeError as e:
+                if "already accessed by another instance" in str(e):
+                    self.client = QdrantClient(location=":memory:")
+                else:
+                    raise
 
         self._init_collection()
 
@@ -207,6 +220,107 @@ class QdrantVectorStore:
         """
         return self._parent_store.get(parent_id)
 
+    def delete_document(self, doc_id: str) -> None:
+        """Delete all points matching doc_id from Qdrant and clear associated parents from cache.
+
+        Args:
+            doc_id: Unique document identifier to remove.
+        """
+        if not doc_id:
+            return
+
+        delete_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="doc_id",
+                    match=models.MatchValue(value=doc_id.strip()),
+                )
+            ]
+        )
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.FilterSelector(filter=delete_filter),
+        )
+
+        # Clear parent cache entries matching doc_id
+        parent_keys_to_delete = [
+            pid for pid, parent in self._parent_store.items()
+            if getattr(parent, "doc_id", "") == doc_id
+        ]
+        for pid in parent_keys_to_delete:
+            self._parent_store.pop(pid, None)
+
+    def load_all_child_chunks(self) -> List[ChildChunk]:
+        """Scroll all indexed points from Qdrant, hydrate parent store, and return ChildChunk instances.
+
+        Returns:
+            List of reconstructed ChildChunk models from persistent vector store.
+        """
+        all_chunks: List[ChildChunk] = []
+        offset = None
+
+        while True:
+            scroll_result, next_offset = self.client.scroll(
+                collection_name=self.collection_name,
+                limit=10000,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+            for point in scroll_result:
+                payload = point.payload or {}
+                chunk_id = payload.get("child_id") or str(point.id)
+                parent_id = payload.get("parent_id", "")
+                doc_id = payload.get("doc_id", "")
+                child_text = payload.get("child_text") or payload.get("text", "")
+                section_name = payload.get("section_path") or payload.get("section_name", "General")
+                page_number = payload.get("page_number", 1)
+                chunk_index = payload.get("chunk_index", 0)
+                relative_path = payload.get("relative_path")
+                folder_hierarchy = payload.get("folder_hierarchy")
+                sparse_tokens = payload.get("sparse_tokens")
+
+                chunk = ChildChunk(
+                    chunk_id=chunk_id,
+                    parent_id=parent_id,
+                    doc_id=doc_id,
+                    text=child_text,
+                    vector=None,
+                    sparse_tokens=sparse_tokens,
+                    page_number=page_number,
+                    chunk_index=chunk_index,
+                    section_name=section_name,
+                    relative_path=relative_path,
+                    folder_hierarchy=folder_hierarchy,
+                )
+                all_chunks.append(chunk)
+
+                # Hydrate parent store if parent_text is present
+                parent_text = payload.get("parent_text")
+                if parent_id and parent_text:
+                    if parent_id not in self._parent_store:
+                        self._parent_store[parent_id] = ParentChunk(
+                            parent_id=parent_id,
+                            doc_id=doc_id,
+                            text=parent_text,
+                            page_number=page_number,
+                            child_ids=[chunk_id],
+                            chunk_index=chunk_index,
+                            section_name=section_name,
+                            relative_path=relative_path,
+                            folder_hierarchy=folder_hierarchy,
+                        )
+                    else:
+                        if chunk_id not in self._parent_store[parent_id].child_ids:
+                            self._parent_store[parent_id].child_ids.append(chunk_id)
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return all_chunks
+
     def search(
         self,
         query_vector: List[float],
@@ -285,6 +399,14 @@ class QdrantVectorStore:
             )
 
         return results
+
+    def close(self) -> None:
+        """Close Qdrant client connection and release local filesystem locks."""
+        if hasattr(self, "client") and self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
 
 
 # Backward compatibility alias

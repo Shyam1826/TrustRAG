@@ -90,6 +90,9 @@ class AtomicClaim(StrictBaseModel):
     claim_id: str
     claim_text: str
     cited_doc_id: Optional[str] = None
+    cited_doc_ids: List[str] = Field(default_factory=list)
+    is_meta: bool = False
+
 
 
 class ClaimAudit(StrictBaseModel):

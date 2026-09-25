@@ -32,7 +32,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.common.schemas import RetrievalCandidate
-from src.pipeline_3_generation.prompt import build_rag_prompt, FALLBACK_INSUFFICIENT_INFO
+from src.pipeline_3_generation.prompt import (
+    FALLBACK_INSUFFICIENT_INFO,
+    build_correction_prompt,
+    build_rag_prompt,
+)
 from src.pipeline_3_generation.generator import (
     GeminiGenerator,
     GroqGenerator,
@@ -40,6 +44,7 @@ from src.pipeline_3_generation.generator import (
     get_generator,
 )
 from src.pipeline_3_generation.citation_check import validate_and_parse_citations
+
 
 
 def test_build_rag_prompt_structure():
@@ -122,6 +127,23 @@ def test_citation_validator_valid():
     assert "[Doc-1]" in draft_unicode.raw_text
     assert "[Doc-2]" in draft_unicode.raw_text
 
+    # Test Asian fullwidth brackets and numeric citations: ［１］ and 【2】
+    asian_brackets_text = "Feature A ［Doc-1］. Feature B ［２］. Feature C 【3】."
+    draft_asian = validate_and_parse_citations(asian_brackets_text, max_valid_doc_id=3)
+    assert draft_asian.cited_doc_ids == ["Doc-1", "Doc-2", "Doc-3"]
+    assert draft_asian.citations_valid is True
+    assert "[Doc-1]" in draft_asian.raw_text
+    assert "[Doc-2]" in draft_asian.raw_text
+    assert "[Doc-3]" in draft_asian.raw_text
+
+    # Test composite multi-citation brackets: [Doc-1, Doc-2] and [1, 3]
+    composite_text = "Comparative feature [Doc-1, Doc-2] and foundational spec [1, 3]."
+    draft_comp = validate_and_parse_citations(composite_text, max_valid_doc_id=3)
+    assert draft_comp.cited_doc_ids == ["Doc-1", "Doc-2", "Doc-3"]
+    assert draft_comp.citations_valid is True
+    assert "[Doc-1][Doc-2]" in draft_comp.raw_text
+    assert "[Doc-1][Doc-3]" in draft_comp.raw_text
+
 
 def test_citation_validator_out_of_bounds():
     text = "The Model-X processor operates at 125W TDP [Doc-9]."
@@ -194,3 +216,38 @@ def test_get_generator_fallback_without_keys():
     with patch("src.common.config.config.generation.gemini_api_key", ""):
         gen_gemini = get_generator("gemini")
         assert isinstance(gen_gemini, MockGenerator)
+
+
+def test_build_correction_prompt_structure():
+    candidates = [
+        RetrievalCandidate(
+            parent_id="p1",
+            doc_id="doc_1",
+            page_number=1,
+            text="Hardware Specs: Model-X operates at 125W TDP.",
+            score=0.95,
+            match_type="cross_encoder_reranked",
+        )
+    ]
+    query = "What is the TDP wattage of Model-X processor?"
+    draft = "Model-X operates at 125W TDP [Doc-1]. It also runs at 5.0 GHz [Doc-1]."
+    failed_claims = ["It also runs at 5.0 GHz."]
+
+    prompt = build_correction_prompt(
+        query=query,
+        context=candidates,
+        draft=draft,
+        failed_claims=failed_claims,
+    )
+
+    # Assert structure and instructions
+    assert "<context>" in prompt
+    assert "</context>" in prompt
+    assert "Hardware Specs: Model-X operates at 125W TDP." in prompt
+    assert "CLOSED-WORLD REWRITE INSTRUCTIONS" in prompt
+    assert "REMOVE or CORRECT the following failed/unverified claims:" in prompt
+    assert "- It also runs at 5.0 GHz." in prompt
+    assert f"Original User Question: {query}" in prompt
+    assert f"Previous Draft Response:\n{draft}" in prompt
+    assert "Strict Semantic Grounding & Closed-World Assumption" in prompt
+

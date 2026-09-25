@@ -5,7 +5,7 @@ r"""
    - Role: Dense vector semantic search executor with native metadata pre-filtering.
    - Purpose: Encodes normalized queries into dense embedding vectors and executes
      native cosine similarity searches against Qdrant vector store child chunk collections
-     with document-level balanced quota allocations and parent deduplication.
+     with dynamic document-level balanced quota allocations and parent deduplication.
 
 2. INPUT (IP):
    - query_text (str): Preprocessed search query from `src/pipeline_2_retrieval/rewriter.py`.
@@ -16,8 +16,8 @@ r"""
 
 3. PROCESS UNDER THE HOOD:
    - Encodes query_text into a 384-dimensional vector using `embedder.embed_dense([query_text])[0]`.
-   - For multi-document filters (`list[str]`), allocates balanced per-document retrieval quotas
-     (`k_per_doc = max(2, top_k // len(doc_filter))`) to ensure fair cross-document representation.
+   - For multi-document filters (`list[str]`), allocates balanced dynamic per-document retrieval quotas
+     (`k_per_doc = max(1, top_k // min(len(clean_filters), 3))`) to ensure fair cross-document representation.
    - For single-document or global search, delegates directly to `vector_store.search()`.
    - Deduplicates matching points by `parent_id` / `child_id` to prevent redundant overlapping slices.
    - Formats results into 1-indexed ranked tuples: `(child_id, rank, similarity_score)`.
@@ -28,13 +28,16 @@ r"""
 
 5. LIBRARIES & DEPENDENCIES:
    - qdrant_client.http.models: Qdrant filtering dataclasses.
-   - typing (List, Tuple, Any, Optional, Union, Dict): Type annotations.
+   - typing (List, Tuple, Any, Optional, Union, Dict, Set): Type annotations.
+   - src.common.config: Central configuration instance.
    - src.pipeline_1_ingestion.vector_store (QdrantVectorStore): Vector storage engine.
 ================================================================================
 """
 
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from qdrant_client.http import models
+
+from src.common.config import config
 
 
 class DenseSearcher:
@@ -80,7 +83,11 @@ class DenseSearcher:
             if len(clean_filters) == 1:
                 return self._search_single(query_vector, top_k, clean_filters[0])
             elif len(clean_filters) > 1:
-                k_per_doc = max(2, top_k // len(clean_filters))
+                configured_cap = getattr(config.retrieval, "max_chunks_per_doc", 3)
+                dynamic_quota = max(1, top_k // min(len(clean_filters), 3))
+                k_per_doc = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
+                k_per_doc = max(1, k_per_doc)
+
                 all_points: List[Tuple[str, float]] = []
                 seen_parents: Set[str] = set()
                 seen_cids: Set[str] = set()
@@ -171,7 +178,10 @@ def retrieve_dense(
         if len(clean_filters) == 1:
             doc_filter = clean_filters[0]
         elif len(clean_filters) > 1:
-            k_per_doc = max(2, top_k // len(clean_filters))
+            configured_cap = getattr(config.retrieval, "max_chunks_per_doc", 3)
+            dynamic_quota = max(1, top_k // min(len(clean_filters), 3))
+            k_per_doc = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
+            k_per_doc = max(1, k_per_doc)
             all_points: List[Tuple[str, float]] = []
             seen_cids: Set[str] = set()
 

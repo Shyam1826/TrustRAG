@@ -1,9 +1,29 @@
-cat << 'EOF' > .gitignore
+# Virtual environment & Python cache
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .pytest_cache/
 scratch/
-data/raw/*.pdf
+
+# Environment secrets
 .env
-EOF
+*.env
+
+# Local vector database, state, and runtime caches
+data/qdrant_db/
+data/ingestion_manifest.json
+
+# All raw data files across any nested subfolder
+data/raw/**/*.pdf
+data/raw/**/*.docx
+data/raw/**/*.txt
+data/raw/*.pdf
+data/raw/*.docx
+data/raw/*.txt
+
+# macOS & OS artifacts
+.DS_Store
+Thumbs.db

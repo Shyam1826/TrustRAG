@@ -274,3 +274,102 @@ def test_query_transformer_folder_domain_extraction():
     assert "engineering" not in clean_q_eng
 
 
+def test_query_transformer_broad_and_comparative_global_retrieval():
+    """Verify that broad, comparative, and multi-topic queries return doc_filter=None for 100% global semantic retrieval."""
+    transformer = QueryTransformer()
+    known_docs = ["engineering/specs", "legal/2026/nda", "candidates/sanjeev_resume", "candidates/vaishalee_resume"]
+
+    # Comparative queries across documents
+    doc_filter, tokens = transformer.extract_doc_filter("Compare the candidates and their experience with Python", known_doc_ids=known_docs)
+    assert doc_filter is None
+    assert tokens == []
+
+    # Queries with "across" or "all"
+    doc_filter_across, _ = transformer.extract_doc_filter("What are the specs across all documents?", known_doc_ids=known_docs)
+    assert doc_filter_across is None
+
+    # Technical query with variable name (no folder scoping, avoiding eager single-keyword token lock)
+    doc_filter_var, _ = transformer.extract_doc_filter("What is d_model in the attention mechanism?", known_doc_ids=known_docs)
+    assert doc_filter_var is None
+
+
+def test_reranker_dynamic_document_diversification():
+    """Verify that dynamic per-document quota prevents a large document from monopolizing top-k retrieval over a smaller document."""
+    # Create LocalStore with Parent chunks for large manual (doc_manual) and short brief (doc_brief)
+    store = LocalStore(location=":memory:")
+
+    # 6 parent chunks for doc_manual (non-consecutive indices representing distinct sections)
+    manual_parents = [
+        ParentChunk(parent_id=f"p_man_{i}", doc_id="doc_manual", text=f"Manual section {i} architecture details", page_number=i, chunk_index=i * 2)
+        for i in range(6)
+    ]
+    # 2 parent chunks for doc_brief
+    brief_parents = [
+        ParentChunk(parent_id=f"p_brf_{i}", doc_id="doc_brief", text=f"Brief section {i} summary overview", page_number=1, chunk_index=i * 2)
+        for i in range(2)
+    ]
+    store.store_parents(manual_parents + brief_parents)
+
+    # 6 child chunks for doc_manual (high semantic overlap)
+    manual_children = [
+        ChildChunk(chunk_id=f"c_man_{i}", parent_id=f"p_man_{i}", doc_id="doc_manual", text=f"Manual chunk {i} architecture", page_number=i, chunk_index=i * 2)
+        for i in range(6)
+    ]
+    # 2 child chunks for doc_brief
+    brief_children = [
+        ChildChunk(chunk_id=f"c_brf_{i}", parent_id=f"p_brf_{i}", doc_id="doc_brief", text=f"Brief chunk {i} summary", page_number=1, chunk_index=i * 2)
+        for i in range(2)
+    ]
+
+    child_map = {c.chunk_id: c for c in (manual_children + brief_children)}
+
+    reranker = CrossEncoderReranker()
+    candidate_cids = [c.chunk_id for c in (manual_children + brief_children)]
+
+    # Request top_k=4 across 2 documents -> dynamic quota = 4 // 2 = 2 per doc
+    resolved = reranker.rerank_and_resolve(
+        query="architecture and summary overview",
+        candidate_child_ids=candidate_cids,
+        child_chunk_map=child_map,
+        local_store=store,
+        top_k=4,
+    )
+
+    assert len(resolved) == 4
+    doc_counts = {}
+    for cand in resolved:
+        doc_counts[cand.doc_id] = doc_counts.get(cand.doc_id, 0) + 1
+
+    # Both documents must have representation bounded by dynamic quota
+    assert doc_counts.get("doc_manual", 0) == 2
+    assert doc_counts.get("doc_brief", 0) == 2
+
+
+def test_apply_rrf_dynamic_document_diversification():
+    """Verify that apply_rrf enforces per-document dynamic quota diversification when child_chunk_map is provided."""
+    # 5 chunks from large doc_a, 2 chunks from small doc_b
+    child_map = {
+        "ca_1": ChildChunk(chunk_id="ca_1", parent_id="pa_1", doc_id="doc_a", text="A1", page_number=1),
+        "ca_2": ChildChunk(chunk_id="ca_2", parent_id="pa_2", doc_id="doc_a", text="A2", page_number=1),
+        "ca_3": ChildChunk(chunk_id="ca_3", parent_id="pa_3", doc_id="doc_a", text="A3", page_number=1),
+        "ca_4": ChildChunk(chunk_id="ca_4", parent_id="pa_4", doc_id="doc_a", text="A4", page_number=1),
+        "cb_1": ChildChunk(chunk_id="cb_1", parent_id="pb_1", doc_id="doc_b", text="B1", page_number=1),
+        "cb_2": ChildChunk(chunk_id="cb_2", parent_id="pb_2", doc_id="doc_b", text="B2", page_number=1),
+    }
+
+    # Dense ranks heavily favoring doc_a
+    dense_ranks = [("ca_1", 1, 0.99), ("ca_2", 2, 0.98), ("ca_3", 3, 0.97), ("ca_4", 4, 0.96), ("cb_1", 5, 0.80)]
+    sparse_ranks = [("ca_1", 1, 9.0), ("ca_2", 2, 8.0), ("cb_1", 3, 7.0), ("ca_3", 4, 6.0)]
+
+    # Request top_n=3 with diversification enabled -> dynamic quota = 3 // 2 = 1 per doc, backfilled to 3
+    fused = apply_rrf(dense_ranks, sparse_ranks, k=60, top_n=3, child_chunk_map=child_map)
+
+    assert len(fused) == 3
+    fused_cids = [cid for cid, _ in fused]
+    # Both doc_a and doc_b must be present
+    assert "cb_1" in fused_cids
+    assert "ca_1" in fused_cids
+
+
+
+

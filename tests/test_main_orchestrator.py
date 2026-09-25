@@ -3,8 +3,8 @@ r"""
 1. PURPOSE & ROLE:
    - Module: tests/test_main_orchestrator.py
    - Role: Integration test suite for TrustRAGPipeline orchestrator.
-   - Purpose: Validates complete end-to-end execution of `TrustRAGPipeline.ingest_pdf`
-     and `TrustRAGPipeline.ask` across all 4 pipelines.
+   - Purpose: Validates complete end-to-end execution of `TrustRAGPipeline.ingest_pdf`,
+     `TrustRAGPipeline.ask`, recursive folder discovery, and 1-pass automated self-correction rewriting.
 
 2. INPUT (IP):
    - Synthesized PDF document and natural language queries.
@@ -15,6 +15,7 @@ r"""
    - Ingests the PDF and verifies chunks and BM25 index.
    - Queries the pipeline with a factual question.
    - Asserts the final `TrustAuditReport` structure, faithfulness score, and safety action.
+   - Tests automated 1-pass corrective rewriting on ungrounded initial drafts.
 
 4. OUTPUT (OP):
    - Pytest assertions and test outcomes.
@@ -131,3 +132,41 @@ def test_recursive_subfolder_document_discovery():
         assert "legal/2026/nda" in pipeline.known_doc_ids
         assert "legal/2025/nda" in pipeline.known_doc_ids
         assert "engineering/specs" in pipeline.known_doc_ids
+        pipeline.close()
+
+
+def test_self_correction_rewrite_loop(orchestrator_pdf_path: str):
+    """Verify that unverified/contradictory drafts trigger 1-pass corrective rewrite to improve faithfulness."""
+    class TwoPassCorrectiveGenerator:
+        def __init__(self):
+            self.call_count = 0
+
+        def generate(self, prompt: str) -> str:
+            self.call_count += 1
+            if "CLOSED-WORLD REWRITE INSTRUCTIONS" in prompt:
+                # Corrected response removing ungrounded assertion
+                return "The Model-X processor features 16 physical cores and operates at 125W TDP [Doc-1]."
+            # Initial buggy draft with ungrounded assertion
+            return (
+                "The Model-X processor features 16 physical cores and operates at 125W TDP [Doc-1].\n"
+                "The processor also integrates an ungrounded 500W quantum chiller unit [Doc-1]."
+            )
+
+    pipeline = TrustRAGPipeline(generator_type="mock")
+    pipeline.generator = TwoPassCorrectiveGenerator()
+
+    # Ingest document
+    pipeline.ingest_pdf(orchestrator_pdf_path, doc_id="hardware_spec_doc")
+
+    # Ask query
+    query = "What is the TDP wattage of Model-X processor?"
+    report = pipeline.ask(query)
+
+    # Asserts that generator was called twice (initial + self-correction rewrite)
+    assert pipeline.generator.call_count == 2
+    assert report.faithfulness_score == 1.0
+    assert report.action == "PASS"
+    assert "quantum chiller" not in report.draft_text
+    assert "125W TDP" in report.draft_text
+    pipeline.close()
+

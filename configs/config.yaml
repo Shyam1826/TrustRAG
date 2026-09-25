@@ -1,0 +1,42 @@
+# ==============================================================================
+# TrustRAG — Central Enterprise System Configuration
+# ==============================================================================
+
+ingestion:
+  supported_extensions:
+    - ".pdf"
+    - ".docx"
+    - ".xlsx"
+    - ".csv"
+    - ".txt"
+  manifest_path: "data/ingestion_manifest.json"
+
+chunking:
+  parent_size: 1400
+  parent_overlap: 200
+  child_size: 300
+  overlap: 50
+
+retrieval:
+  top_k_dense: 30
+  top_k_rerank: 10
+  rrf_k: 60
+  max_chunks_per_doc: 3
+  enable_document_diversification: true
+  custom_stop_words: []
+
+verification:
+  tau_entailment: 0.75
+  tau_contradiction: 0.65
+  premise_window_size: 1400
+  normalize_unicode_citations: true
+
+models:
+  dense_model_name: "BAAI/bge-small-en-v1.5"
+  reranker_model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  nli_model_name: "cross-encoder/nli-deberta-v3-base"
+
+generation:
+  provider: "groq"
+  groq_model: "qwen/qwen3.8-27b"
+  gemini_model: "gemini-1.5-flash"

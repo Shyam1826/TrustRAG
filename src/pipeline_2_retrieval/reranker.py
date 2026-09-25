@@ -2,11 +2,12 @@ r"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_2_retrieval/reranker.py
-   - Role: Cross-Encoder neural reranker and neighbor context expansion resolver.
+   - Role: Cross-Encoder neural reranker, neighbor context expansion, and diversity resolver.
    - Purpose: Performs deep cross-attention between queries and candidate child chunks,
      evaluates full interaction representations, resolves winning child chunks to
-     parent context passages, and merges adjacent neighbor chunks from the same document
-     into unified, non-fragmented context blocks.
+     parent context passages, merges adjacent neighbor chunks from the same document
+     into unified context blocks, and enforces mathematical per-document diversification quotas
+     to prevent large corpora from starving smaller documents.
 
 2. INPUT (IP):
    - query (str): Cleaned query string from `src/pipeline_2_retrieval/rewriter.py`.
@@ -24,7 +25,10 @@ r"""
      * Groups resolved parent chunks by `doc_id`.
      * Identifies adjacent neighbor chunks within the same document (consecutive `chunk_index`).
      * Merges adjacent parent passages into unified multi-section context blocks.
-   - Deduplicates and ranks final merged contexts descending by cross-encoder score.
+   - Applies Mathematical Document Diversification:
+     * Computes dynamic quota cap `max_chunks_per_source = max(1, top_k // min(num_unique_matching_docs, 3))`.
+     * Selects candidates in descending score order respecting per-document quota limits.
+     * Backfills from remaining highest-scoring candidates if fewer than `top_k` are selected.
    - Returns up to `top_k` strictly typed `RetrievalCandidate` models.
 
 4. OUTPUT (OP):
@@ -184,20 +188,33 @@ class CrossEncoderReranker:
         # Sort all candidates descending by cross-encoder relevance score
         expanded_candidates.sort(key=lambda x: x.score, reverse=True)
 
-        if len(doc_parents) > 1:
-            # Multi-document balanced selection: ensure top passage from each document is included
+        num_unique_matching_docs = len({cand.doc_id for cand in expanded_candidates})
+
+        if getattr(config.retrieval, "enable_document_diversification", True) and num_unique_matching_docs > 1:
+            configured_cap = getattr(config.retrieval, "max_chunks_per_doc", 3)
+            dynamic_quota = max(1, top_k // min(num_unique_matching_docs, 3))
+            max_chunks_per_source = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
+            max_chunks_per_source = max(1, max_chunks_per_source)
+
             selected: List[RetrievalCandidate] = []
-            seen_docs: Set[str] = set()
-            for cand in expanded_candidates:
-                if cand.doc_id not in seen_docs:
-                    selected.append(cand)
-                    seen_docs.add(cand.doc_id)
+            doc_counts: Dict[str, int] = defaultdict(int)
+            remaining: List[RetrievalCandidate] = []
 
+            # 1. Quota-based diversification pass
             for cand in expanded_candidates:
-                if cand not in selected and len(selected) < max(top_k, len(doc_parents) * 2):
+                if doc_counts[cand.doc_id] < max_chunks_per_source and len(selected) < top_k:
+                    selected.append(cand)
+                    doc_counts[cand.doc_id] += 1
+                else:
+                    remaining.append(cand)
+
+            # 2. Backfill from remaining highest-scoring candidates regardless of source
+            if len(selected) < top_k:
+                for cand in remaining:
+                    if len(selected) >= top_k:
+                        break
                     selected.append(cand)
 
-            selected.sort(key=lambda x: x.score, reverse=True)
-            return selected[:max(top_k, len(doc_parents) * 2)]
+            return selected
 
         return expanded_candidates[:top_k]
