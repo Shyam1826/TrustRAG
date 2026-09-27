@@ -110,10 +110,10 @@ class AuditAdjudicator:
         return ENGLISH_STOP_WORDS | custom
 
     def _clean_hypothesis_for_nli(self, claim_text: str) -> str:
-        """Strip meta-document scaffolding from hypothesis before passing to DeBERTa.
+        """Strip meta-document scaffolding, Doc-X carriers, and section anchors from hypothesis.
 
-        Removes structural carrier framing (e.g., 'The resume for Sanjeev M focuses on...',
-        'The engineering specifications document describes...', 'According to the resume of X...')
+        Removes structural carrier framing (e.g., 'The candidate in Doc-1 focuses on...',
+        'The engineering specs in Doc-7 describe...', 'Under Candidate Resume Focus, the document specifies:...')
         to produce clean, grounded affirmative propositions that align directly with factual premise text.
 
         Args:
@@ -124,41 +124,13 @@ class AuditAdjudicator:
         """
         cleaned = claim_text.strip()
 
-        # Universal document meta-descriptor types (e.g., engineering specifications document, resume, CV, paper)
-        doc_types = (
-            r"(?:(?:[a-zA-Z_0-9-]+\s+)*(?:resume|cv|document|specs?|specifications?(?:\s+document)?|"
-            r"paper|contract|agreement|report|overview|profile|guidelines?|manual|datasheet|candidate))"
-        )
-        verbs = (
-            r"(?:focuses\s+on|focuses|lists|describes|states\s+that|states|notes\s+that|notes|"
-            r"details|features|specifies|highlights|presents|outlines|defines|mentions|identifies)"
-        )
-
-        # 1. ^The <doc_types> (for|of|titled|regarding|named) <entity> <verbs>:?
+        # 1. Section Scaffolding
         cleaned = re.sub(
-            rf"^The\s+{doc_types}\s+(?:for|of|titled|regarding|named)\s+[^:;,\n]+?\s+{verbs}:?\s*",
+            r"^Under\s+[^,;]+,\s+(?:the\s+documented\s+(?:items?\s+include|specification\s+or\s+item\s+is)|the\s+document\s+specifies):\s*",
             "",
             cleaned,
             flags=re.IGNORECASE,
         )
-
-        # 2. ^The <doc_types> <verbs>:?
-        cleaned = re.sub(
-            rf"^The\s+{doc_types}\s+{verbs}:?\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-
-        # 3. ^According to (the)? <doc_types> (for/of ...)? [,:]
-        cleaned = re.sub(
-            rf"^According\s+to\s+(?:the\s+)?{doc_types}(?:\s+(?:for|of|titled|regarding|named)\s+[^:;,\n]+?)?[,:]\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-
-        # 4. ^Under [Section], (the candidate/document ...)?
         cleaned = re.sub(
             r"^Under\s+[^,:]+[,:]\s*(?:the\s+(?:candidate|document|specification|item|technologies)\s+(?:completed|specifies|states|utilizes|features|include|utilized\s+include|documented\s+specification\s+or\s+item\s+is|documented\s+items\s+include):?\s*)?",
             "",
@@ -166,7 +138,69 @@ class AuditAdjudicator:
             flags=re.IGNORECASE,
         )
         cleaned = re.sub(
-            r"^The\s+(?:document\s+specifies|technologies\s+utilized\s+include):?\s*",
+            r"^The\s+document\s+specifies:\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^The\s+(?:technologies\s+utilized\s+include|documented\s+(?:items?\s+include|specification\s+or\s+item\s+is)):\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        # 2. Document Carrier Scaffolding with Doc-X handles
+        cleaned = re.sub(
+            r"^The\s+candidate\s+in\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+\s+(?:focuses\s+on|lists|describes|details|highlights):?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^The\s+(?:engineering\s+specs?|specifications?|documents?|reports?|proposals?|contracts?)\s+in\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+\s+(?:describes?|states?\s+that|notes?\s+that|details?|specifies?\s+that|specifies?|highlights?|features?):?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^In\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+[,\s]+(?:the\s+candidate|the\s+document|the\s+specification)\s+(?:focuses\s+on|lists|describes|states\s+that|notes\s+that|details|features|specifies):?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        # 3. Universal Document Carrier Scaffolding (Resumes, Specs, Contracts, Reports, Spreadsheets, etc.)
+        doc_types = (
+            r"(?:(?:[a-zA-Z_0-9-]+\s+)*(?:resume|cv|document|specs?|specifications?(?:\s+document)?|"
+            r"paper|contract|agreement|report|overview|profile|guidelines?|manual|datasheet|candidate|"
+            r"workbook|spreadsheet|sheet))"
+        )
+        verbs = (
+            r"(?:focuses\s+on|focuses|lists|describes|states\s+that|states|notes\s+that|notes|"
+            r"details|features|specifies\s+that|specifies|reports\s+that|reports|highlights|presents|"
+            r"outlines|defines|mentions|identifies)"
+        )
+
+        # ^The <doc_types> (for|of|titled|regarding|named) <entity> <verbs>:?
+        cleaned = re.sub(
+            rf"^The\s+{doc_types}\s+(?:for|of|titled|regarding|named)\s+[^:;,\n]+?\s+{verbs}:?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        # ^The <doc_types> <verbs>:?
+        cleaned = re.sub(
+            rf"^The\s+{doc_types}\s+{verbs}:?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        # ^According to (the)? <doc_types> (for/of ...)? [,:]
+        cleaned = re.sub(
+            rf"^According\s+to\s+(?:the\s+)?{doc_types}(?:\s+(?:for|of|titled|regarding|named)\s+[^:;,\n]+?)?[,:]\s*",
             "",
             cleaned,
             flags=re.IGNORECASE,

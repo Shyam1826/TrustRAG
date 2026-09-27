@@ -37,8 +37,10 @@ r"""
    - Step 9: Context citation inheritance: inherits `last_seen_citations` within active section for
      sub-bullets lacking explicit inline citations.
    - Step 10: Structural proposition framing:
-     * Strips colon-separated structural topic labels (`^[A-Za-z0-9\s/&_-]{2,30}:\s*`).
+     * Preserves colon-separated entity attribute labels (`^[A-Za-z0-9\s/&_-]{2,30}:\s*`) and constructs
+       relational copula assertions (`The {label} is {val}.`).
      * Anchors short items/specifications with active section scope.
+     * Ensures single-token fragments are never emitted without a relational copula ('is', 'features', 'contains').
    - Step 11: Emits `AtomicClaim` models with sequential IDs (`claim_0`, `claim_1`, ...).
 
 4. OUTPUT (OP):
@@ -321,35 +323,39 @@ class AtomicClaimExtractor:
                 sec_label = current_section
 
                 # Universal domain-agnostic proposition framing
-                if len(tokens) < 3:
+                colon_prefix_match = re.match(r"^[A-Za-z0-9\s/&_-]{2,30}:\s*", clean_claim)
+                if colon_prefix_match:
+                    label = clean_claim[:colon_prefix_match.end()].strip().rstrip(":").strip()
+                    val = clean_claim[colon_prefix_match.end():].strip()
+                    if label and val:
+                        if label.lower().startswith("the "):
+                            anchored_claim = f"{label} is {val}."
+                        else:
+                            anchored_claim = f"The {label} is {val}."
+                    elif val:
+                        anchored_claim = f"The document specifies: {val}."
+                    else:
+                        anchored_claim = clean_claim
+                elif len(tokens) < 3:
                     # 1-2 word items or specifications
                     if sec_label and sec_label.lower() != "general":
                         anchored_claim = f"Under {sec_label}, the documented specification or item is: {clean_claim}."
                     else:
                         anchored_claim = f"The document specifies: {clean_claim}."
+                elif sec_label and sec_label.lower() != "general":
+                    anchored_claim = f"Under {sec_label}, the document specifies: {clean_claim}"
                 else:
-                    # 3+ tokens: generalized colon-separated prefix stripping
-                    colon_prefix_match = re.match(r"^[A-Za-z0-9\s/&_-]{2,30}:\s*", clean_claim)
-                    if colon_prefix_match:
-                        body = clean_claim[colon_prefix_match.end():].strip()
-                        if sec_label and sec_label.lower() != "general":
-                            anchored_claim = f"Under {sec_label}, the documented items include: {body}"
-                        else:
-                            anchored_claim = f"The document specifies: {body}"
-                    elif sec_label and sec_label.lower() != "general":
-                        anchored_claim = f"Under {sec_label}, the document specifies: {clean_claim}"
+                    # Generic short noun phrase or statement framing
+                    verbs = {
+                        "is", "are", "was", "were", "has", "have", "had", "shall", "will", "may",
+                        "can", "could", "provides", "contains", "specifies", "features", "includes",
+                        "details", "describes", "focuses", "specializes", "developed", "built",
+                        "holds", "completed", "architected", "serves", "works", "uses", "utilizes",
+                    }
+                    if len(tokens) <= 10 and not any(t.lower() in verbs for t in tokens):
+                        anchored_claim = f"The document specifies: {clean_claim}"
                     else:
-                        # Generic short noun phrase or statement framing
-                        verbs = {
-                            "is", "are", "was", "were", "has", "have", "had", "shall", "will", "may",
-                            "can", "could", "provides", "contains", "specifies", "features", "includes",
-                            "details", "describes", "focuses", "specializes", "developed", "built",
-                            "holds", "completed", "architected", "serves", "works", "uses", "utilizes",
-                        }
-                        if len(tokens) <= 10 and not any(t.lower() in verbs for t in tokens):
-                            anchored_claim = f"The document specifies: {clean_claim}"
-                        else:
-                            anchored_claim = clean_claim
+                        anchored_claim = clean_claim
 
                 if not anchored_claim.endswith("."):
                     anchored_claim += "."

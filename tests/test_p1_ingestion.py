@@ -411,3 +411,92 @@ def test_dynamic_sentence_boundary_slicing():
 
     # Verify that sentence ending was recognized cleanly
     assert any(s.endswith(".") for s in slices)
+
+
+def test_read_excel_tabular_serialization(tmp_path):
+    """Verify that read_excel correctly serializes multi-sheet workbooks into structured section blocks."""
+    import pandas as pd
+    from src.pipeline_1_ingestion.reader import read_excel
+
+    excel_path = tmp_path / "test_sla.xlsx"
+
+    with pd.ExcelWriter(str(excel_path), engine="openpyxl") as writer:
+        # Sheet 1: SLA Tiers with empty row and unnamed col
+        df1 = pd.DataFrame({
+            "Tier Name": ["Platinum Tier", "Gold Tier", None],
+            "Uptime Target": ["99.99%", "99.9%", None],
+            "Max Response": ["15 minutes", "1 hour", None],
+            "Unnamed: 3": [None, None, None],
+        })
+        df1.to_excel(writer, sheet_name="SLA Definitions", index=False)
+
+        # Sheet 2: Contacts
+        df2 = pd.DataFrame({
+            "Role": ["Lead Escalation", "Support Lead"],
+            "Contact": ["PagerDuty", "Email"],
+        })
+        df2.to_excel(writer, sheet_name="Contacts", index=False)
+
+    pages = read_excel(excel_path, doc_id="operations/test_sla")
+
+    assert len(pages) == 2
+
+    # Sheet 1 assertions
+    sheet1 = pages[0]
+    assert sheet1["page_number"] == 1
+    assert "## Sheet: SLA Definitions" in sheet1["raw_text"]
+    assert "[Sheet: SLA Definitions]" in sheet1["raw_text"]
+    assert "Tier Name: Platinum Tier" in sheet1["raw_text"]
+    assert "Uptime Target: 99.99%" in sheet1["raw_text"]
+    assert "Max Response: 15 minutes" in sheet1["raw_text"]
+    assert "Tier Name: Gold Tier" in sheet1["raw_text"]
+
+    # Sheet 2 assertions
+    sheet2 = pages[1]
+    assert sheet2["page_number"] == 2
+    assert "## Sheet: Contacts" in sheet2["raw_text"]
+    assert "Role: Lead Escalation" in sheet2["raw_text"]
+    assert "Contact: PagerDuty" in sheet2["raw_text"]
+
+
+def test_read_document_dispatcher(tmp_path):
+    """Verify that read_document correctly routes across file extensions."""
+    import pandas as pd
+    from src.pipeline_1_ingestion.reader import read_document
+
+    # Excel file
+    excel_path = tmp_path / "sample.xlsx"
+    pd.DataFrame({"A": [1, 2], "B": ["X", "Y"]}).to_excel(excel_path, index=False)
+    excel_pages = read_document(excel_path)
+    assert len(excel_pages) == 1
+    assert "## Sheet: Sheet1" in excel_pages[0]["raw_text"]
+
+    # Text file
+    txt_path = tmp_path / "notes.txt"
+    txt_path.write_text("General system operational guidelines.", encoding="utf-8")
+    txt_pages = read_document(txt_path)
+    assert len(txt_pages) == 1
+    assert "General system operational guidelines." in txt_pages[0]["raw_text"]
+
+
+def test_discover_raw_documents_includes_excel(tmp_path):
+    """Verify that discover_raw_documents detects .xlsx and .xls files across subfolder trees."""
+    import pandas as pd
+    from src.pipeline_1_ingestion.discover import discover_raw_documents
+
+    sub_dir = tmp_path / "operations" / "finance"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+
+    excel_file = sub_dir / "Q4_Revenue_Matrix.xlsx"
+    pd.DataFrame({"Q4": [100]}).to_excel(excel_file, index=False)
+
+    discovered = discover_raw_documents(raw_dir=tmp_path)
+    assert len(discovered) >= 1
+
+    match = next((d for d in discovered if "Q4_Revenue_Matrix" in d[1]), None)
+    assert match is not None
+    file_path, doc_id, rel_str, folders = match
+    assert doc_id == "operations/finance/Q4_Revenue_Matrix"
+    assert rel_str == "operations/finance/Q4_Revenue_Matrix.xlsx"
+    assert folders == ["operations", "finance"]
+

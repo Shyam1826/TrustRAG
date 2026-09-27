@@ -674,6 +674,27 @@ def test_hypothesis_scaffolding_cleaning():
     c6 = "The processor operates at 125W TDP."
     assert adjudicator._clean_hypothesis_for_nli(c6) == "The processor operates at 125W TDP."
 
+    # Doc-X candidate carrier scaffolding
+    c7 = "The candidate in Doc-1 focuses on natural language processing and transformer architectures."
+    assert adjudicator._clean_hypothesis_for_nli(c7) == "Natural language processing and transformer architectures."
+
+    # Doc-X specs carrier scaffolding
+    c8 = "The engineering specs in Doc-7 describe Multi-Head Attention as parallel attention layers."
+    assert adjudicator._clean_hypothesis_for_nli(c8) == "Multi-Head Attention as parallel attention layers."
+
+    # Section scaffolding
+    c9 = "Under Candidate Resume Focus, the document specifies: Sanjeev specializes in AI business proposals."
+    assert adjudicator._clean_hypothesis_for_nli(c9) == "Sanjeev specializes in AI business proposals."
+
+    # Document specifies scaffolding
+    c10 = "The document specifies: Developed automated data analysis pipelines."
+    assert adjudicator._clean_hypothesis_for_nli(c10) == "Developed automated data analysis pipelines."
+
+    # Excel spreadsheet carrier scaffolding
+    c11 = "The spreadsheet document for operations specifies that Tier 1 Enterprise availability target is 99.99%."
+    assert adjudicator._clean_hypothesis_for_nli(c11) == "Tier 1 Enterprise availability target is 99.99%."
+
+
 
 def test_context_metadata_header_prepending():
     """Verify that _resolve_context_text prepends document and section metadata when available."""
@@ -722,6 +743,39 @@ def test_adjudicator_premise_token_budget_bound():
 
     assert len(premise) <= 1200
     assert "[Document: Arch_Doc | Section: Core]" in premise
+
+
+def test_colon_separated_key_value_relational_extraction():
+    """Verify that colon-separated key-value lines retain attribute labels as relational assertions."""
+    extractor = AtomicClaimExtractor()
+
+    draft = GeneratedDraft(
+        raw_text=(
+            "### Service Level Agreement\n"
+            "- Application Name: Quantum Sim_9254 [Doc-1]\n"
+            "- Target Availability: 99.99% [Doc-1]\n"
+            "- Role: Lead Architect [Doc-2]\n"
+            "- Status: Active [Doc-2]"
+        ),
+        cited_doc_ids=["Doc-1", "Doc-2"],
+        citations_valid=True,
+    )
+
+    claims = extractor.extract_claims(draft)
+
+    assert len(claims) == 4
+    assert claims[0].claim_text == "The Application Name is Quantum Sim_9254."
+    assert claims[0].cited_doc_ids == ["Doc-1"]
+
+    assert claims[1].claim_text == "The Target Availability is 99.99%."
+    assert claims[1].cited_doc_ids == ["Doc-1"]
+
+    assert claims[2].claim_text == "The Role is Lead Architect."
+    assert claims[2].cited_doc_ids == ["Doc-2"]
+
+    assert claims[3].claim_text == "The Status is Active."
+    assert claims[3].cited_doc_ids == ["Doc-2"]
+
 
 
 

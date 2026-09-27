@@ -59,10 +59,12 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from src.common.config import config
 from src.common.schemas import ChildChunk, ParentChunk, RetrievalCandidate, TrustAuditReport
 from src.pipeline_1_ingestion.chunker import create_hierarchical_chunks
+from src.pipeline_1_ingestion.discover import discover_raw_documents
 from src.pipeline_1_ingestion.embedder import DualEmbedder
 from src.pipeline_1_ingestion.indexer import LocalStore
 from src.pipeline_1_ingestion.manifest import IngestionManifest
 from src.pipeline_1_ingestion.parser import extract_pdf_pages
+from src.pipeline_1_ingestion.reader import read_document
 from src.pipeline_2_retrieval.fusion import apply_rrf
 from src.pipeline_2_retrieval.reranker import CrossEncoderReranker
 from src.pipeline_2_retrieval.rewriter import QueryTransformer
@@ -77,53 +79,6 @@ from src.pipeline_4_verification.nli_model import DebertaNLIVerifier
 
 
 SUPPORTED_DOCUMENT_EXTENSIONS: Set[str] = set(config.ingestion.supported_extensions)
-
-
-def discover_raw_documents(
-    raw_dir: Union[str, Path] = "data/raw",
-    supported_extensions: Optional[Set[str]] = None,
-) -> List[Tuple[Path, str, str, List[str]]]:
-    """Recursively discover document files in raw_dir across all subfolder depths.
-
-    Args:
-        raw_dir: Base directory path to scan.
-        supported_extensions: Optional set of allowed file extensions.
-
-    Returns:
-        List of tuples: `(file_path, doc_id, relative_path_str, folder_hierarchy)`.
-    """
-    base_dir = Path(raw_dir)
-    if not base_dir.exists():
-        return []
-
-    exts = supported_extensions or set(config.ingestion.supported_extensions)
-    discovered: List[Tuple[Path, str, str, List[str]]] = []
-
-    for file_path in sorted(base_dir.rglob("*")):
-        if not file_path.is_file():
-            continue
-
-        try:
-            rel_path = file_path.relative_to(base_dir)
-        except ValueError:
-            rel_path = Path(file_path.name)
-
-        # Ignore hidden system files and hidden directory segments
-        if any(part.startswith(".") for part in rel_path.parts):
-            continue
-
-        if file_path.suffix.lower() not in exts:
-            continue
-
-        # Derive clean, collision-safe doc_id (e.g., "legal/2026/nda")
-        rel_str = str(rel_path).replace("\\", "/")
-        rel_stem_str = str(rel_path.with_suffix("")).replace("\\", "/")
-        doc_id = rel_stem_str
-        folder_hierarchy = [p for p in rel_path.parent.parts if p and p != "."]
-
-        discovered.append((file_path, doc_id, rel_str, folder_hierarchy))
-
-    return discovered
 
 
 class TrustRAGPipeline:
@@ -210,18 +165,18 @@ class TrustRAGPipeline:
 
         return list(aliases)
 
-    def ingest_pdf(
+    def ingest_document(
         self,
-        pdf_path: str,
+        file_path: str,
         doc_id: Optional[str] = None,
         relative_path: Optional[str] = None,
         folder_hierarchy: Optional[List[str]] = None,
         force_reindex: bool = False,
     ) -> List[ChildChunk]:
-        """Ingest, chunk, embed, and index a PDF document with incremental manifest caching.
+        """Ingest, chunk, embed, and index a document (PDF, Excel .xlsx/.xls, CSV, TXT) with manifest caching.
 
         Args:
-            pdf_path: File path to the PDF document.
+            file_path: File system path to the document.
             doc_id: Optional unique identifier for the document (defaults to relative stem).
             relative_path: Optional full relative subfolder path.
             folder_hierarchy: Optional list of parent folder categories.
@@ -230,9 +185,9 @@ class TrustRAGPipeline:
         Returns:
             List of indexed ChildChunk models.
         """
-        path = Path(pdf_path)
+        path = Path(file_path)
         if not path.is_file():
-            raise FileNotFoundError(f"PDF document not found at: {pdf_path}")
+            raise FileNotFoundError(f"Document file not found at: {file_path}")
 
         try:
             rel = path.relative_to("data/raw")
@@ -260,8 +215,8 @@ class TrustRAGPipeline:
         self.all_child_chunks = [c for c in self.all_child_chunks if c.doc_id != assigned_doc_id]
         self.child_chunk_map = {cid: c for cid, c in self.child_chunk_map.items() if c.doc_id != assigned_doc_id}
 
-        # Step 1: Extract pages
-        pages = extract_pdf_pages(str(path))
+        # Step 1: Extract pages/sheets via format-specific reader
+        pages = read_document(path, doc_id=assigned_doc_id)
         if not pages:
             print(f"Warning: No readable text extracted from {path.name}.")
             return []
@@ -322,6 +277,23 @@ class TrustRAGPipeline:
         print(f"Successfully indexed {len(children)} chunks from {path.name} (doc_id: '{assigned_doc_id}').")
         return children
 
+    def ingest_pdf(
+        self,
+        pdf_path: str,
+        doc_id: Optional[str] = None,
+        relative_path: Optional[str] = None,
+        folder_hierarchy: Optional[List[str]] = None,
+        force_reindex: bool = False,
+    ) -> List[ChildChunk]:
+        """Backward-compatible alias for ingest_document."""
+        return self.ingest_document(
+            file_path=pdf_path,
+            doc_id=doc_id,
+            relative_path=relative_path,
+            folder_hierarchy=folder_hierarchy,
+            force_reindex=force_reindex,
+        )
+
     def ingest_directory(
         self,
         raw_dir: str = "data/raw",
@@ -347,13 +319,13 @@ class TrustRAGPipeline:
         skipped_count = 0
 
         for file_path, doc_id, rel_str, folders in discovered:
-            if file_path.suffix.lower() == ".pdf":
+            if file_path.suffix.lower() in exts:
                 if not force_reindex and self.manifest.is_indexed_and_current(file_path, doc_id):
                     print(f"[Ingestion] '{doc_id}' unchanged (already indexed) -> Skipping.")
                     self.known_doc_ids.add(doc_id)
                     skipped_count += 1
                 else:
-                    chunks = self.ingest_pdf(
+                    chunks = self.ingest_document(
                         str(file_path),
                         doc_id=doc_id,
                         relative_path=rel_str,

@@ -58,7 +58,7 @@ except ImportError:
 class IngestionConfig(BaseModel):
     """File ingestion and incremental manifest settings."""
     supported_extensions: List[str] = Field(
-        default_factory=lambda: [".pdf", ".docx", ".xlsx", ".csv", ".txt", ".jpg", ".png"]
+        default_factory=lambda: [".pdf", ".docx", ".xlsx", ".xls", ".csv", ".txt", ".jpg", ".png"]
     )
     manifest_path: str = "data/ingestion_manifest.json"
 
@@ -85,7 +85,7 @@ class VerificationConfig(BaseModel):
     """Natural language inference and adjudication thresholds."""
     tau_entailment: float = 0.75
     tau_contradiction: float = 0.65
-    premise_window_size: int = 1400
+    premise_window_size: int = 1200
     normalize_unicode_citations: bool = True
 
 

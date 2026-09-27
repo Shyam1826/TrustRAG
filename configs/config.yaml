@@ -7,6 +7,7 @@ ingestion:
     - ".pdf"
     - ".docx"
     - ".xlsx"
+    - ".xls"
     - ".csv"
     - ".txt"
   manifest_path: "data/ingestion_manifest.json"
@@ -28,7 +29,7 @@ retrieval:
 verification:
   tau_entailment: 0.75
   tau_contradiction: 0.65
-  premise_window_size: 1400
+  premise_window_size: 1200
   normalize_unicode_citations: true
 
 models:

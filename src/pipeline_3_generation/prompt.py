@@ -40,6 +40,7 @@ r"""
          * If a requested entity category has only one matching item in the text, report only that single item.
      * Rule 4 (Structured Atomic Bullets & Verbatim Source Fidelity):
        - Exhaustively list all relevant facts, specifications, or items as concise bullet points.
+       - Formulate assertions as complete, self-contained grammatical sentences connecting entity and attribute.
        - If an item is listed only as a title or name, output ONLY that title verbatim.
      * Rule 5 (ASCII Inline Citations):
        - Append standard ASCII square brackets like [Doc-1] or [Doc-2] to every factual assertion and comparative clause.
@@ -119,6 +120,7 @@ def build_rag_prompt(query: str, contexts: List[RetrievalCandidate]) -> str:
         "4. (Structured Atomic Bullets & Verbatim Source Fidelity):\n"
         "   - Exhaustively list all relevant facts, specifications, items, or properties mentioned in <context>.\n"
         "   - Format each distinct fact as a concise bullet point, reproducing names and explicit details directly from <context>.\n"
+        "   - Complete Sentence Structure: Formulate every assertion as a complete, self-contained grammatical sentence connecting entity and attribute (e.g., write 'The application located in Tokyo is Quantum Sim_9254 [Doc-1].' rather than isolated key-value fragments like 'Application Name: Quantum Sim_9254 [Doc-1]').\n"
         "   - If an item in <context> is listed only as a title, name, or short phrase, output ONLY that title or phrase verbatim (e.g. `- Item Name [Doc-1]`). Do NOT invent parenthetical explanations, definitions, or ungrounded commentary.\n"
         "5. (ASCII Inline Citations & Critical Citation Fidelity):\n"
         "   - You MUST append an inline document citation tag to EVERY factual assertion, bullet, or comparative clause.\n"
@@ -180,6 +182,7 @@ def build_correction_prompt(
         f"{failed_list_str}\n"
         "3. (Strict Semantic Grounding & Closed-World Assumption):\n"
         "   - Include ONLY positive facts explicitly written in the <context>.\n"
+        "   - Complete Sentence Structure: Formulate every assertion as a complete, self-contained grammatical sentence connecting entity and attribute (e.g., write 'The application located in Tokyo is Quantum Sim_9254 [Doc-1].').\n"
         "   - Do NOT include any unmentioned tools, libraries, frameworks, or specifications.\n"
         "   - Do NOT output meta-commentary or negative statements about missing data.\n"
         "4. (ASCII Inline Citations & Critical Citation Fidelity):\n"
