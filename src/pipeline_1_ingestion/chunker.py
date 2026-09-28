@@ -27,11 +27,14 @@ r"""
    - Structural Heading Attachment: Section titles are NEVER emitted as standalone isolated chunks.
      Instead, identified headings are preserved in `pending_heading` state and prefixed directly to the
      subsequent body text as `## {heading}\n{body_text}`.
-   - Dynamic Sentence-Boundary Slicing: Replaces rigid character cuts with punctuation-aware sliding
-     windows. Locates natural sentence delimiters (`[.!?]\s+`, `\n{2,}`, `\n(?=[-*•#\d])`) within a ±15%
-     boundary search margin of target child size, falling back to whitespace delimiters to prevent
-     partial words or broken grammatical clauses.
-   - Minimum Chunk Size Threshold (15 words): Any parent or child block containing fewer than 15 words
+   - Boundary-Aware Syntactic Chunking: Replaces fixed-character windowing with recursive boundary degradation:
+     * Priority 1: Structural Headings / Section Delimiters (`\n\n## `, `\n\n`).
+     * Priority 2: Atomic Record / List Item Boundaries (`\n[-*•]`, `\n[A-Za-z0-9_]+:`, `\n`).
+     * Priority 3: Sentence Terminators (`(?<=[.!?])\s+(?=[A-Z0-9])`).
+     * Priority 4: Word Boundaries (`\s+`).
+     * Hard Rule: Never splits across an atomic entity record (table row, bullet item, key-value pair)
+       unless that single record independently exceeds the maximum child character ceiling.
+   - Minimum Chunk Size Threshold (15 words / ~100 chars): Any parent or child block containing fewer than 15 words
      is automatically merged into the adjacent chunk (or carried forward), ensuring zero isolated stub
      chunks enter Qdrant or downstream vector indexes.
    - Inlines contextual breadcrumb `[Document: {doc_id} | Section: {section_name}]` into parent text.
@@ -59,13 +62,84 @@ from src.common.config import config
 from src.common.schemas import ChildChunk, ParentChunk
 
 
-def slice_text_dynamically(text: str, c_size: int, c_overlap: int) -> List[str]:
-    """Slice text into overlapping child chunks along natural sentence and word boundaries.
+def _count_words_chunk(text: str) -> int:
+    """Count words excluding Markdown heading hashes."""
+    clean = re.sub(r"^#+\s*", "", text.strip())
+    return len(clean.split())
 
-    Locates the nearest natural sentence delimiter (such as punctuation followed by
-    whitespace or line breaks) within a boundary search margin (±15% of child target size).
-    If no natural delimiter is found within margin, falls back to whitespace splitting.
-    Never emits a chunk ending in a partial word.
+
+def _split_into_atomic_units(text: str, max_unit_size: int) -> List[str]:
+    """Recursively degrade text into atomic syntactic units across boundary hierarchies.
+
+    Priority 1: Structural Headings / Section Delimiters (\\n\\n## , \\n\\n)
+    Priority 2: Atomic Record / List Item Boundaries (\\n(?=[-*•]), \\n(?=[A-Za-z0-9_]+:), \\n)
+    Priority 3: Sentence Terminators ((?<=[.!?])\\s+(?=[A-Z0-9]) or (?<=[.!?])\\s+)
+    Priority 4: Word Boundaries (\\s+)
+    """
+    if not text or not text.strip():
+        return []
+
+    stripped = text.strip()
+    if len(stripped) <= max_unit_size:
+        return [stripped]
+
+    # Priority 1: Split on Structural Headings and Section Delimiters (\n\n## , \n\n)
+    p1_parts = [p.strip() for p in re.split(r"(?:\n\n## |\n\n+)", stripped) if p.strip()]
+    if len(p1_parts) > 1:
+        units: List[str] = []
+        for part in p1_parts:
+            units.extend(_split_into_atomic_units(part, max_unit_size))
+        return units
+
+    # Priority 2: Split on Atomic Record / List Item / Key-Value Boundaries
+    # (\n(?=[-*•]), \n(?=[A-Za-z0-9_]+:), \n)
+    p2_parts = [p.strip() for p in re.split(r"\n(?=[-*•])|\n(?=[A-Za-z0-9_]+:)|\n+", stripped) if p.strip()]
+    if len(p2_parts) > 1:
+        units = []
+        for part in p2_parts:
+            units.extend(_split_into_atomic_units(part, max_unit_size))
+        return units
+
+    # Priority 3: Split on Sentence Terminators (?<=[.!?])\s+(?=[A-Z0-9]) or (?<=[.!?])\s+
+    p3_parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])|(?<=[.!?])\s+", stripped) if p.strip()]
+    if len(p3_parts) > 1:
+        units = []
+        for part in p3_parts:
+            units.extend(_split_into_atomic_units(part, max_unit_size))
+        return units
+
+    # Priority 4: Word Boundaries (\s+) for exceptionally long unbroken single clauses
+    p4_parts = [p.strip() for p in re.split(r"\s+", stripped) if p.strip()]
+    if len(p4_parts) > 1:
+        accumulated: List[str] = []
+        curr = ""
+        for w in p4_parts:
+            if not curr:
+                curr = w
+            elif len(curr) + 1 + len(w) <= max_unit_size:
+                curr += " " + w
+            else:
+                accumulated.append(curr)
+                curr = w
+        if curr:
+            accumulated.append(curr)
+        return accumulated
+
+    return [stripped]
+
+
+def slice_text_dynamically(text: str, c_size: int, c_overlap: int) -> List[str]:
+    """Slice text into overlapping child chunks using recursive boundary degradation.
+
+    Deconstructs parent text into atomic syntactic units across boundary priorities:
+    - Priority 1: Structural Headings / Section Delimiters (`\\n\\n## `, `\\n\\n`)
+    - Priority 2: Atomic Record / List Item Boundaries (`\\n[-*•]`, `\\n[A-Za-z0-9_]+:`, `\\n`)
+    - Priority 3: Sentence Terminators (`(?<=[.!?])\\s+(?=[A-Z0-9])`)
+    - Priority 4: Word Boundaries (`\\s+`)
+
+    Hard Rule: Never splits across an atomic entity record unless that single record
+    independently exceeds the child size ceiling. Enforces minimum chunk floor (>=15 words / ~100 chars),
+    merging trailing fragments into the preceding chunk.
 
     Args:
         text: Raw parent text block to slice.
@@ -79,77 +153,58 @@ def slice_text_dynamically(text: str, c_size: int, c_overlap: int) -> List[str]:
     if not stripped or len(stripped) <= c_size:
         return [stripped] if stripped else []
 
+    atomic_units = _split_into_atomic_units(stripped, max_unit_size=c_size)
+    if not atomic_units:
+        return [stripped]
+
     slices: List[str] = []
-    text_len = len(text)
-    start = 0
-    margin = max(10, int(c_size * 0.15))
+    current_units: List[str] = []
+    current_len = 0
 
-    while start < text_len:
-        target_end = start + c_size
-        if target_end >= text_len:
-            tail = text[start:].strip()
-            if tail:
-                slices.append(tail)
-            break
+    for unit in atomic_units:
+        sep_len = 1 if current_units else 0
+        if current_len + sep_len + len(unit) <= c_size:
+            current_units.append(unit)
+            current_len += sep_len + len(unit)
+        else:
+            if current_units:
+                chunk_str = " ".join(current_units).strip()
+                slices.append(chunk_str)
 
-        # Search window for sentence boundary: [target_end - margin, target_end + margin]
-        search_start = max(start + 10, target_end - margin)
-        search_end = min(text_len, target_end + margin)
-        search_sub = text[search_start:search_end]
-
-        # 1. Search for natural sentence boundaries (. ! ? \n\n or \n followed by bullet/heading)
-        sentence_cut = None
-        matches = list(re.finditer(r'([.!?]+["\')\]]?\s+|\n{2,}|\n(?=[-*•#\d]))', search_sub))
-        if matches:
-            best_m = min(matches, key=lambda m: abs((search_start + m.end()) - target_end))
-            sentence_cut = search_start + best_m.end()
-
-        # 2. Fallback: clause or newline breaks (; : \n)
-        if sentence_cut is None:
-            matches = list(re.finditer(r'([;:]\s+|\n)', search_sub))
-            if matches:
-                best_m = min(matches, key=lambda m: abs((search_start + m.end()) - target_end))
-                sentence_cut = search_start + best_m.end()
-
-        # 3. Fallback: nearest whitespace boundary within search margin
-        if sentence_cut is None:
-            matches = list(re.finditer(r'\s+', search_sub))
-            if matches:
-                best_m = min(matches, key=lambda m: abs((search_start + m.end()) - target_end))
-                sentence_cut = search_start + best_m.end()
-
-        # 4. Ultimate fallback: find any whitespace boundary to avoid cutting inside words
-        if sentence_cut is None:
-            forward_ws = re.search(r'\s+', text[target_end:])
-            if forward_ws:
-                sentence_cut = target_end + forward_ws.end()
-            else:
-                backward_ws = list(re.finditer(r'\s+', text[start:target_end]))
-                if backward_ws:
-                    sentence_cut = start + backward_ws[-1].end()
+                # Overlap: retain trailing atomic units up to c_overlap
+                if c_overlap > 0:
+                    overlap_units: List[str] = []
+                    overlap_len = 0
+                    for u in reversed(current_units):
+                        u_len = len(u) + (1 if overlap_units else 0)
+                        if overlap_len + u_len <= c_overlap:
+                            overlap_units.insert(0, u)
+                            overlap_len += u_len
+                        else:
+                            break
+                    current_units = list(overlap_units)
+                    current_len = sum(len(u) for u in current_units) + (len(current_units) - 1 if current_units else 0)
                 else:
-                    sentence_cut = target_end
+                    current_units = []
+                    current_len = 0
 
-        # Extract current chunk slice
-        chunk = text[start:sentence_cut].strip()
-        if chunk:
-            slices.append(chunk)
+            # Add the current unit
+            current_units.append(unit)
+            current_len += (1 if current_len > 0 else 0) + len(unit)
 
-        if sentence_cut >= text_len:
-            break
+    if current_units:
+        chunk_str = " ".join(current_units).strip()
+        if chunk_str:
+            slices.append(chunk_str)
 
-        # Compute next start position with overlap, snapping to word boundary
-        desired_start = max(start + 1, sentence_cut - c_overlap)
-        if desired_start < text_len and not text[desired_start].isspace():
-            prev_space = text.rfind(" ", start, desired_start)
-            if prev_space != -1 and prev_space > start:
-                desired_start = prev_space + 1
-            else:
-                next_space = text.find(" ", desired_start, min(text_len, desired_start + 20))
-                if next_space != -1:
-                    desired_start = next_space + 1
-
-        start = max(start + 1, desired_start)
+    # Enforce minimum chunk floor (>= 15 words or >= 100 characters):
+    # Merge any short trailing fragment into previous slice
+    if len(slices) > 1:
+        last_slice = slices[-1]
+        last_words = _count_words_chunk(last_slice)
+        if (last_words < 15 and len(last_slice) < 100) or last_words < 5:
+            slices[-2] = f"{slices[-2]} {last_slice}".strip()
+            slices.pop()
 
     return slices
 

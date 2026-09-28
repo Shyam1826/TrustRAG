@@ -2,10 +2,10 @@ r"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_2_retrieval/fusion.py
-   - Role: Hybrid rank fusion and document diversification engine.
+   - Role: Hybrid rank fusion and intent-adaptive document diversification engine.
    - Purpose: Combines dense semantic and sparse lexical ranking lists into a single,
      robust candidate list using Reciprocal Rank Fusion (RRF), eliminating the need for
-     arbitrary score calibration across disparate scoring scales, with optional dynamic
+     arbitrary score calibration across disparate scoring scales, with intent-adaptive
      per-document quota diversification.
 
 2. INPUT (IP):
@@ -15,6 +15,8 @@ r"""
    - top_n (int): Number of top fused candidates to return (default 20).
    - child_chunk_map (dict[str, Any], optional): Map of chunk IDs to ChildChunk instances for per-doc quota.
    - max_chunks_per_doc (int, optional): Maximum allowed chunks per document during fusion.
+   - query (str, optional): Cleaned query string for intent-adaptive allocation.
+   - is_comparative (bool, optional): Explicit override for comparative diversification intent.
 
 3. PROCESS UNDER THE HOOD:
    - Evaluates the standard Reciprocal Rank Fusion formula:
@@ -24,11 +26,12 @@ r"""
    - Iterates through sparse ranked pairs and adds `1.0 / (k + rank)`.
    - Deduplicates items across dense and sparse retrievers.
    - Sorts candidate IDs descending by cumulative RRF score.
-   - If `child_chunk_map` is provided and multi-document diversification is active:
-     * Calculates dynamic quota cap: `max_chunks_per_source = max(1, top_n // min(num_unique_matching_docs, 3))`.
-     * Selects candidates in descending RRF order respecting per-document quota limits.
+   - Intent-Adaptive Diversification:
+     * For single-domain/entity queries: allows top-matching document to fill context slots
+       without artificial suppression (pure score order up to top_n).
+     * For comparative/multi-document queries: enforces proportional representation across
+       unique matched document sources (`max_chunks_per_source = max(1, top_n // min(num_docs, 3))`).
      * Backfills from remaining candidates if fewer than `top_n` are selected.
-   - Otherwise, truncates directly to the top_n items.
 
 4. OUTPUT (OP):
    - list[tuple[str, float]]: List of `(child_id, rrf_score)` candidate tuples.
@@ -36,15 +39,40 @@ r"""
 
 5. LIBRARIES & DEPENDENCIES:
    - collections.defaultdict: Dictionary with default float values for fast score accumulation.
+   - re: Regex pattern matching for comparative intent classification.
    - typing (Dict, List, Optional, Tuple, Any): Standard type hints.
    - src.common.config: Central configuration instance.
 ================================================================================
 """
 
 from collections import defaultdict
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.common.config import config
+
+_COMPARATIVE_QUERY_REGEX = re.compile(
+    r"\b(?:"
+    r"compare|comparison|difference|differences|versus|vs|both|"
+    r"contrast|contrasting|across|between|each|all\s+(?:candidates|documents|resumes|specs|papers|files|records)|"
+    r"and\s+.*(?:difference|compare|contrast|versus|vs)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_comparative_query(query: Optional[str]) -> bool:
+    """Detect if a user query demonstrates comparative or cross-document intent.
+
+    Args:
+        query: Query string to evaluate.
+
+    Returns:
+        True if comparative intent is detected, False otherwise.
+    """
+    if not query:
+        return False
+    return bool(_COMPARATIVE_QUERY_REGEX.search(query))
 
 
 def apply_rrf(
@@ -54,8 +82,10 @@ def apply_rrf(
     top_n: int = 20,
     child_chunk_map: Optional[Dict[str, Any]] = None,
     max_chunks_per_doc: Optional[int] = None,
+    query: Optional[str] = None,
+    is_comparative: Optional[bool] = None,
 ) -> List[Tuple[str, float]]:
-    """Combine dense and sparse ranked lists using Reciprocal Rank Fusion (RRF) with dynamic document diversification.
+    """Combine dense and sparse ranked lists using Reciprocal Rank Fusion (RRF) with intent-adaptive diversification.
 
     Formula:
         RRF_Score(d) = sum_{s in systems} (1.0 / (k + rank_s(d)))
@@ -67,6 +97,8 @@ def apply_rrf(
         top_n: Maximum number of fused candidate tuples to return.
         child_chunk_map: Optional mapping of child_id to ChildChunk for document-level diversification.
         max_chunks_per_doc: Optional override for max chunks per document.
+        query: Optional user query string for intent-adaptive allocation.
+        is_comparative: Optional explicit boolean flag declaring comparative intent.
 
     Returns:
         List of tuples sorted descending by RRF score: [(child_id, rrf_score), ...].
@@ -88,7 +120,7 @@ def apply_rrf(
         reverse=True,
     )
 
-    # Apply dynamic document diversification if child_chunk_map is provided
+    # Apply intent-adaptive document diversification if child_chunk_map is provided
     if child_chunk_map and getattr(config.retrieval, "enable_document_diversification", True):
         matching_docs = {
             getattr(child_chunk_map[cid], "doc_id", None)
@@ -99,35 +131,52 @@ def apply_rrf(
         num_docs = len(matching_docs)
 
         if num_docs > 1:
-            configured_cap = max_chunks_per_doc if max_chunks_per_doc is not None else getattr(config.retrieval, "max_chunks_per_doc", 3)
-            dynamic_quota = max(1, top_n // min(num_docs, 3))
-            max_chunks_per_source = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
-            max_chunks_per_source = max(1, max_chunks_per_source)
+            # Determine comparative intent
+            comparative_intent = (
+                is_comparative
+                if is_comparative is not None
+                else (is_comparative_query(query) if query is not None else True)
+            )
 
-            selected: List[Tuple[str, float]] = []
-            doc_counts: Dict[str, int] = defaultdict(int)
-            remaining: List[Tuple[str, float]] = []
+            if comparative_intent:
+                # Comparative/multi-document intent: enforce proportional representation across sources
+                configured_cap = (
+                    max_chunks_per_doc
+                    if max_chunks_per_doc is not None
+                    else getattr(config.retrieval, "max_chunks_per_doc", 3)
+                )
+                dynamic_quota = max(1, top_n // min(num_docs, 4))
+                max_chunks_per_source = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
+                max_chunks_per_source = max(1, max_chunks_per_source)
 
-            for cid, score in sorted_candidates:
-                doc_id = getattr(child_chunk_map[cid], "doc_id", None) if cid in child_chunk_map else None
-                if doc_id and doc_counts[doc_id] < max_chunks_per_source and len(selected) < top_n:
-                    selected.append((cid, score))
-                    doc_counts[doc_id] += 1
-                elif not doc_id and len(selected) < top_n:
-                    selected.append((cid, score))
-                else:
-                    remaining.append((cid, score))
+                selected: List[Tuple[str, float]] = []
+                doc_counts: Dict[str, int] = defaultdict(int)
+                remaining: List[Tuple[str, float]] = []
 
-            if len(selected) < top_n:
-                for item in remaining:
-                    if len(selected) >= top_n:
-                        break
-                    selected.append(item)
+                for cid, score in sorted_candidates:
+                    doc_id = getattr(child_chunk_map[cid], "doc_id", None) if cid in child_chunk_map else None
+                    if doc_id and doc_counts[doc_id] < max_chunks_per_source and len(selected) < top_n:
+                        selected.append((cid, score))
+                        doc_counts[doc_id] += 1
+                    elif not doc_id and len(selected) < top_n:
+                        selected.append((cid, score))
+                    else:
+                        remaining.append((cid, score))
 
-            return selected
+                if len(selected) < top_n:
+                    for item in remaining:
+                        if len(selected) >= top_n:
+                            break
+                        selected.append(item)
+
+                return selected
+            else:
+                # Single-domain/entity query: allow top-matching document to fill context slots without artificial suppression
+                return sorted_candidates[:top_n]
 
     return sorted_candidates[:top_n]
 
 
 # Functional alias for unified interface naming
 apply_rrf_fusion = apply_rrf
+

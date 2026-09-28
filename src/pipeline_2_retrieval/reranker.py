@@ -50,6 +50,7 @@ from sentence_transformers import CrossEncoder
 
 from src.common.config import config
 from src.common.schemas import ChildChunk, ParentChunk, RetrievalCandidate
+from src.pipeline_2_retrieval.fusion import is_comparative_query
 
 
 def get_optimal_device() -> str:
@@ -191,30 +192,35 @@ class CrossEncoderReranker:
         num_unique_matching_docs = len({cand.doc_id for cand in expanded_candidates})
 
         if getattr(config.retrieval, "enable_document_diversification", True) and num_unique_matching_docs > 1:
-            configured_cap = getattr(config.retrieval, "max_chunks_per_doc", 3)
-            dynamic_quota = max(1, top_k // min(num_unique_matching_docs, 3))
-            max_chunks_per_source = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
-            max_chunks_per_source = max(1, max_chunks_per_source)
+            is_comp = is_comparative_query(query)
+            if is_comp:
+                configured_cap = getattr(config.retrieval, "max_chunks_per_doc", 3)
+                dynamic_quota = max(1, top_k // min(num_unique_matching_docs, 4))
+                max_chunks_per_source = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
+                max_chunks_per_source = max(1, max_chunks_per_source)
 
-            selected: List[RetrievalCandidate] = []
-            doc_counts: Dict[str, int] = defaultdict(int)
-            remaining: List[RetrievalCandidate] = []
+                selected: List[RetrievalCandidate] = []
+                doc_counts: Dict[str, int] = defaultdict(int)
+                remaining: List[RetrievalCandidate] = []
 
-            # 1. Quota-based diversification pass
-            for cand in expanded_candidates:
-                if doc_counts[cand.doc_id] < max_chunks_per_source and len(selected) < top_k:
-                    selected.append(cand)
-                    doc_counts[cand.doc_id] += 1
-                else:
-                    remaining.append(cand)
+                # 1. Quota-based diversification pass
+                for cand in expanded_candidates:
+                    if doc_counts[cand.doc_id] < max_chunks_per_source and len(selected) < top_k:
+                        selected.append(cand)
+                        doc_counts[cand.doc_id] += 1
+                    else:
+                        remaining.append(cand)
 
-            # 2. Backfill from remaining highest-scoring candidates regardless of source
-            if len(selected) < top_k:
-                for cand in remaining:
-                    if len(selected) >= top_k:
-                        break
-                    selected.append(cand)
+                # 2. Backfill from remaining highest-scoring candidates regardless of source
+                if len(selected) < top_k:
+                    for cand in remaining:
+                        if len(selected) >= top_k:
+                            break
+                        selected.append(cand)
 
-            return selected
+                return selected
+            else:
+                # Single-domain/entity query: allow top-matching document to fill context slots without artificial suppression
+                return expanded_candidates[:top_k]
 
         return expanded_candidates[:top_k]

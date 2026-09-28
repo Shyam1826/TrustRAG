@@ -500,3 +500,23 @@ def test_discover_raw_documents_includes_excel(tmp_path):
     assert rel_str == "operations/finance/Q4_Revenue_Matrix.xlsx"
     assert folders == ["operations", "finance"]
 
+
+def test_recursive_boundary_degradation_atomic_records():
+    """Verify that recursive boundary degradation preserves atomic entity records (table rows and list items) intact."""
+    from src.pipeline_1_ingestion.chunker import slice_text_dynamically
+
+    tabular_records = (
+        "Row 1: Application Name: Quantum Sim_9254 | Tier: Tier 1 | Target Availability: 99.99% | Unit/Location: Tokyo\n"
+        "Row 2: Application Name: Cloud Matrix_102 | Tier: Tier 2 | Target Availability: 99.9% | Unit/Location: London\n"
+        "Row 3: Application Name: Cyber Shield_88 | Tier: Tier 1 | Target Availability: 99.99% | Unit/Location: Singapore"
+    )
+
+    slices = slice_text_dynamically(tabular_records, c_size=200, c_overlap=30)
+    assert len(slices) == 3
+
+    # Every atomic row must remain completely intact without internal splitting
+    assert "Row 1: Application Name: Quantum Sim_9254 | Tier: Tier 1 | Target Availability: 99.99% | Unit/Location: Tokyo" in slices[0]
+    assert "Row 2: Application Name: Cloud Matrix_102 | Tier: Tier 2 | Target Availability: 99.9% | Unit/Location: London" in slices[1]
+    assert "Row 3: Application Name: Cyber Shield_88 | Tier: Tier 1 | Target Availability: 99.99% | Unit/Location: Singapore" in slices[2]
+
+

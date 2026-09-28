@@ -37,7 +37,7 @@ from src.pipeline_1_ingestion.vector_store import QdrantVectorStore
 from src.pipeline_2_retrieval.rewriter import QueryTransformer
 from src.pipeline_2_retrieval.search_dense import DenseSearcher, retrieve_dense
 from src.pipeline_2_retrieval.search_sparse import BM25Searcher
-from src.pipeline_2_retrieval.fusion import apply_rrf
+from src.pipeline_2_retrieval.fusion import apply_rrf, is_comparative_query
 from src.pipeline_2_retrieval.reranker import CrossEncoderReranker
 
 
@@ -369,6 +369,40 @@ def test_apply_rrf_dynamic_document_diversification():
     # Both doc_a and doc_b must be present
     assert "cb_1" in fused_cids
     assert "ca_1" in fused_cids
+
+
+def test_intent_adaptive_retrieval_diversification():
+    """Verify that single-entity queries allow top-doc chunks to fill context slots without artificial suppression, while comparative queries enforce proportional multi-source representation."""
+    # 1. Verify query intent detection
+    assert is_comparative_query("Compare the experience of Alice and Bob") is True
+    assert is_comparative_query("What is the difference between Model-A and Model-B?") is True
+    assert is_comparative_query("Summary across all documents") is True
+    assert is_comparative_query("What are the applications located in Tokyo?") is False
+    assert is_comparative_query("What is the TDP wattage of Model-X processor?") is False
+
+    # 2. Setup mock chunks
+    child_map = {
+        "ca_1": ChildChunk(chunk_id="ca_1", parent_id="pa_1", doc_id="doc_a", text="Doc A item 1", page_number=1),
+        "ca_2": ChildChunk(chunk_id="ca_2", parent_id="pa_2", doc_id="doc_a", text="Doc A item 2", page_number=1),
+        "ca_3": ChildChunk(chunk_id="ca_3", parent_id="pa_3", doc_id="doc_a", text="Doc A item 3", page_number=1),
+        "cb_1": ChildChunk(chunk_id="cb_1", parent_id="pb_1", doc_id="doc_b", text="Doc B item 1", page_number=1),
+    }
+    dense_ranks = [("ca_1", 1, 0.99), ("ca_2", 2, 0.95), ("ca_3", 3, 0.90), ("cb_1", 4, 0.50)]
+    sparse_ranks = [("ca_1", 1, 9.0), ("ca_2", 2, 8.0), ("ca_3", 3, 7.0), ("cb_1", 4, 2.0)]
+
+    # Single-entity query: top doc (doc_a) fills top_n=3 slots without suppression
+    single_q = "What are the applications located in Tokyo?"
+    fused_single = apply_rrf(dense_ranks, sparse_ranks, k=60, top_n=3, child_chunk_map=child_map, query=single_q)
+    single_cids = [cid for cid, _ in fused_single]
+    assert single_cids == ["ca_1", "ca_2", "ca_3"]
+
+    # Comparative query: enforces proportional multi-document representation
+    comp_q = "Compare the features between doc_a and doc_b"
+    fused_comp = apply_rrf(dense_ranks, sparse_ranks, k=60, top_n=3, child_chunk_map=child_map, query=comp_q)
+    comp_cids = [cid for cid, _ in fused_comp]
+    assert "cb_1" in comp_cids
+    assert "ca_1" in comp_cids
+
 
 
 

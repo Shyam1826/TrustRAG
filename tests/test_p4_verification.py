@@ -777,6 +777,68 @@ def test_colon_separated_key_value_relational_extraction():
     assert claims[3].cited_doc_ids == ["Doc-2"]
 
 
+def test_comparative_multi_citation_clause_decomposition():
+    """Verify that multi-citation comparative sentences are decomposed into independent clauses and adjudicated against respective document premises."""
+    adjudicator = AuditAdjudicator()
+
+    class MockVerifier:
+        def predict_batch(self, claims, premises):
+            results = []
+            for c, p in zip(claims, premises):
+                if "react" in c.lower() and "react" in p.lower():
+                    results.append({"probabilities": {"entailment": 0.95, "contradiction": 0.01, "neutral": 0.04}})
+                elif "encoder" in c.lower() and "encoder" in p.lower():
+                    results.append({"probabilities": {"entailment": 0.98, "contradiction": 0.01, "neutral": 0.01}})
+                else:
+                    results.append({"probabilities": {"entailment": 0.10, "contradiction": 0.10, "neutral": 0.80}})
+            return results
+
+    claim = AtomicClaim(
+        claim_id="claim_comp_0",
+        claim_text="Under Comparison, the document specifies: Candidate A lists React.js and Node.js for web development, while the specifications describe an encoder composed of stacks of N = 6 identical layers.",
+        cited_doc_ids=["Doc-1", "Doc-2"],
+    )
+
+    context_map = {
+        "Doc-1": "[Document: Candidate_A | Section: Skills]\nTechnical Skills: React.js, Node.js, JavaScript, Python.",
+        "Doc-2": "[Document: Model_Spec | Section: Architecture]\nModel Architecture: The encoder is composed of a stack of N = 6 identical layers.",
+    }
+
+    report = adjudicator.adjudicate(
+        claims=[claim],
+        context_map=context_map,
+        nli_verifier=MockVerifier(),
+        draft_text="Comparative summary draft.",
+    )
+
+    assert len(report.audits) == 1
+    audit = report.audits[0]
+    assert audit.verdict == "ENTAILED"
+    assert audit.confidence >= 0.90
+    assert "[Doc-1]:" in audit.cited_premise
+    assert "[Doc-2]:" in audit.cited_premise
+    assert report.faithfulness_score == 1.00
+    assert report.action == "PASS"
+
+
+def test_recursive_stacked_hypothesis_scaffolding():
+    """Verify that recursive fixed-point hypothesis cleaning peels off multi-layered section and carrier scaffolding."""
+    adjudicator = AuditAdjudicator()
+
+    # Triple-nested framing: Section -> Entity Mention -> Verb
+    c1 = "Under Engineering Specs Technical Stack, the document specifies: The Attention Mechanism Spec states that the encoder is composed of a stack of N = 6 identical layers."
+    assert adjudicator._clean_hypothesis_for_nli(c1) == "The encoder is composed of a stack of N = 6 identical layers."
+
+    # Section + Resume possessive + List verb
+    c2 = "Under Candidate Resume Focus, the document specifies: Karthik’s resume lists technical skills including JavaScript, TypeScript, and Python."
+    assert adjudicator._clean_hypothesis_for_nli(c2) == "Technical skills including JavaScript, TypeScript, and Python."
+
+    # Section + Universal framing + Plural verb
+    c3 = "Under System Architecture, the document specifies: The engineering specs describe an attention function mapping queries to values."
+    assert adjudicator._clean_hypothesis_for_nli(c3) == "An attention function mapping queries to values."
+
+
+
 
 
 

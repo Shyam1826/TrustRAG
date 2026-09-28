@@ -408,12 +408,14 @@ class TrustRAGPipeline:
             dense_results = future_dense.result()
             sparse_results = future_sparse.result()
 
-        # 3. Reciprocal Rank Fusion
+        # 3. Reciprocal Rank Fusion with Intent-Adaptive Diversification
         fused_candidates = apply_rrf(
             dense_ranks=dense_results,
             sparse_ranks=sparse_results,
             k=config.retrieval.rrf_k,
             top_n=top_k_dense,
+            child_chunk_map=self.child_chunk_map,
+            query=clean_query,
         )
         candidate_cids = [cid for cid, _ in fused_candidates]
 
@@ -443,9 +445,9 @@ class TrustRAGPipeline:
         default_section = top_contexts[0].section_name if top_contexts else None
         claims = self.claim_extractor.extract_claims(generated_draft, default_section=default_section)
 
-        # 9. Premise Mapping
-        context_map: Dict[str, str] = {
-            f"Doc-{idx}": getattr(context, "parent_text", None) or context.text
+        # 9. Premise Mapping (providing candidate models with full parent context and document metadata)
+        context_map: Dict[str, Any] = {
+            f"Doc-{idx}": context
             for idx, context in enumerate(top_contexts, start=1)
         }
 

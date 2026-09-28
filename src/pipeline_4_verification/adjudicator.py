@@ -75,8 +75,9 @@ r"""
 ================================================================================
 """
 
+from collections import defaultdict
 import re
-from typing import Any, Dict, List, Literal, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
 from src.common.config import config
@@ -85,6 +86,11 @@ from src.common.schemas import AtomicClaim, ClaimAudit, TrustAuditReport
 
 class AuditAdjudicator:
     """Evaluates NLI scores across claims, computes faithfulness, and determines safety actions."""
+
+    _COMPARATIVE_SPLIT_REGEX = re.compile(
+        r",\s*(?:while|whereas|meanwhile|whilst|in\s+contrast(?:\s+to)?|on\s+the\s+other\s+hand|as\s+opposed\s+to|distinct\s+from|which\s+is\s+distinct\s+from)\s+|\s+(?:while|whereas|whilst)\s+|;\s*",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -110,11 +116,11 @@ class AuditAdjudicator:
         return ENGLISH_STOP_WORDS | custom
 
     def _clean_hypothesis_for_nli(self, claim_text: str) -> str:
-        """Strip meta-document scaffolding, Doc-X carriers, and section anchors from hypothesis.
+        """Iteratively strip nested meta-document scaffolding, Doc-X carriers, and section anchors from hypothesis.
 
-        Removes structural carrier framing (e.g., 'The candidate in Doc-1 focuses on...',
-        'The engineering specs in Doc-7 describe...', 'Under Candidate Resume Focus, the document specifies:...')
-        to produce clean, grounded affirmative propositions that align directly with factual premise text.
+        Executes an iterative normalization loop until reaching a fixed point (no further changes) to peel off
+        stacked framing (e.g., 'Under <Section>, the document specifies: The <DocType> states that <Assertion>')
+        and produce clean, grounded affirmative propositions for DeBERTa-v3 NLI verification.
 
         Args:
             claim_text: Raw atomic claim text.
@@ -122,89 +128,98 @@ class AuditAdjudicator:
         Returns:
             Cleaned affirmative proposition text.
         """
-        cleaned = claim_text.strip()
+        if not claim_text:
+            return ""
 
-        # 1. Section Scaffolding
-        cleaned = re.sub(
-            r"^Under\s+[^,;]+,\s+(?:the\s+documented\s+(?:items?\s+include|specification\s+or\s+item\s+is)|the\s+document\s+specifies):\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r"^Under\s+[^,:]+[,:]\s*(?:the\s+(?:candidate|document|specification|item|technologies)\s+(?:completed|specifies|states|utilizes|features|include|utilized\s+include|documented\s+specification\s+or\s+item\s+is|documented\s+items\s+include):?\s*)?",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r"^The\s+document\s+specifies:\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r"^The\s+(?:technologies\s+utilized\s+include|documented\s+(?:items?\s+include|specification\s+or\s+item\s+is)):\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
+        cleaned = claim_text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"').strip()
 
-        # 2. Document Carrier Scaffolding with Doc-X handles
-        cleaned = re.sub(
-            r"^The\s+candidate\s+in\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+\s+(?:focuses\s+on|lists|describes|details|highlights):?\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r"^The\s+(?:engineering\s+specs?|specifications?|documents?|reports?|proposals?|contracts?)\s+in\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+\s+(?:describes?|states?\s+that|notes?\s+that|details?|specifies?\s+that|specifies?|highlights?|features?):?\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r"^In\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+[,\s]+(?:the\s+candidate|the\s+document|the\s+specification)\s+(?:focuses\s+on|lists|describes|states\s+that|notes\s+that|details|features|specifies):?\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
+        doc_types = r"(?:resume|cv|specifications?|specs?|document|paper|report|contract|agreement|template|candidate|overview|profile|guidelines?|manual|datasheet|workbook|spreadsheet|sheet)"
+        verbs = r"(?:states?\s+that|states?|notes?\s+that|notes?|describes?|specifies?\s+that|specifies?|features?|lists?|reports?\s+that|reports?|highlights?|presents?|outlines?|defines?|mentions?|identifies?|focuses\s+on|focuses)"
 
-        # 3. Universal Document Carrier Scaffolding (Resumes, Specs, Contracts, Reports, Spreadsheets, etc.)
-        doc_types = (
-            r"(?:(?:[a-zA-Z_0-9-]+\s+)*(?:resume|cv|document|specs?|specifications?(?:\s+document)?|"
-            r"paper|contract|agreement|report|overview|profile|guidelines?|manual|datasheet|candidate|"
-            r"workbook|spreadsheet|sheet))"
-        )
-        verbs = (
-            r"(?:focuses\s+on|focuses|lists|describes|states\s+that|states|notes\s+that|notes|"
-            r"details|features|specifies\s+that|specifies|reports\s+that|reports|highlights|presents|"
-            r"outlines|defines|mentions|identifies)"
-        )
+        for _ in range(10):
+            prev = cleaned
 
-        # ^The <doc_types> (for|of|titled|regarding|named) <entity> <verbs>:?
-        cleaned = re.sub(
-            rf"^The\s+{doc_types}\s+(?:for|of|titled|regarding|named)\s+[^:;,\n]+?\s+{verbs}:?\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
+            # 1. Section Scaffolding
+            cleaned = re.sub(
+                r"^Under\s+[^,;:]+,\s*(?:the\s+documented\s+[^:]+:|the\s+document\s+specifies:)\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^Under\s+[^,:]+[,:]\s*(?:the\s+(?:candidate|document|specification|item|technologies)\s+(?:completed|specifies|states|utilizes|features|include|utilized\s+include|documented\s+specification\s+or\s+item\s+is|documented\s+items\s+include):?\s*)?",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^The\s+document\s+specifies:\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^The\s+(?:technologies\s+utilized\s+include|documented\s+(?:items?\s+include|specification\s+or\s+item\s+is)):\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
 
-        # ^The <doc_types> <verbs>:?
-        cleaned = re.sub(
-            rf"^The\s+{doc_types}\s+{verbs}:?\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
+            # 2. Document Carrier Scaffolding with Doc-X handles
+            cleaned = re.sub(
+                r"^The\s+candidate\s+in\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+\s+(?:focuses\s+on|lists?|describes?|details?|highlights?):?\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^The\s+(?:engineering\s+specs?|specifications?|documents?|reports?|proposals?|contracts?)\s+in\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+\s+(?:describes?|states?\s+that|notes?\s+that|details?|specifies?\s+that|specifies?|highlights?|features?):?\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^In\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+[,\s]+(?:the\s+candidate|the\s+document|the\s+specification)\s+(?:focuses\s+on|lists?|describes?|states?\s+that|notes?\s+that|details?|features?|specifies?):?\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
 
-        # ^According to (the)? <doc_types> (for/of ...)? [,:]
-        cleaned = re.sub(
-            rf"^According\s+to\s+(?:the\s+)?{doc_types}(?:\s+(?:for|of|titled|regarding|named)\s+[^:;,\n]+?)?[,:]\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
+            # 3. Universal Document Carrier Scaffolding: ^The (<desc> )?<doc_type> (for/of ...) <carrier_verbs>
+            cleaned = re.sub(
+                rf"^(?:The\s+)?(?:[A-Za-z0-9_.'/\s-]+?\s+)?{doc_types}(?:\s+(?:for|of|titled|regarding|named)\s+[^:;,\n]+?)?\s+{verbs}\s*:?\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+
+            # 4. Source/Entity with doc_type or possessive: ^<Entity> ('s <doc_type>? | <doc_type>) <carrier_verbs>
+            cleaned = re.sub(
+                rf"^(?:The\s+)?[A-Za-z0-9_.'/\s-]+?\s+(?:'s\s+(?:{doc_types}\s+)?|{doc_types}\s+){verbs}\s*:?\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+
+            # 5. Source/Entity with explicit attribution verbs
+            cleaned = re.sub(
+                r"^(?:The\s+)?[A-Za-z0-9_.'/\s-]+?\s+(?:states?\s+that|notes?\s+that|specifies?\s+that|reports?\s+that|focuses\s+on)\s*:?\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^According\s+to\s+(?:the\s+)?[A-Za-z0-9_.'/\s-]+?[,:]\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+
+            # Strip leading/trailing punctuation and whitespace (preserving trailing period)
+            cleaned = re.sub(r"^[\s,;:.-]+|[\s,;:-]+$", "", cleaned).strip()
+
+            if cleaned == prev:
+                break
 
         # Capitalize first character if lowercase
         if cleaned and cleaned[0].islower():
@@ -253,7 +268,8 @@ class AuditAdjudicator:
         """Extract the section breadcrumb and most relevant block from context for the given claim.
 
         Expands to clean sentence and paragraph boundaries up to premise_window_size (max ~350 words),
-        preserving mathematical equations and full parent context within DeBERTa's 512-token limit.
+        using symbolic keyword weighting for exact quantitative parameters, variables, and formulas
+        within DeBERTa's 512-token limit.
 
         Args:
             claim_text: Proposition text of the atomic claim.
@@ -290,12 +306,11 @@ class AuditAdjudicator:
         body_text = "\n".join(body_lines)
 
         # Split body text into natural sentence / bullet / paragraph segments
-        # Preserves complete sentence boundaries without splitting words
         raw_segments = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", body_text) if s.strip()]
         if not raw_segments:
             return norm_context
 
-        # Score each segment based on keyword overlap density
+        # Score each segment based on symbolic-weighted keyword overlap density
         best_idx = 0
         best_score = -1.0
         matching_indices: List[int] = []
@@ -305,11 +320,21 @@ class AuditAdjudicator:
             seg_words = set(w for w in seg_tokens if w not in stop_words)
             if not seg_words:
                 continue
-            overlap = len(claim_words & seg_words)
-            if overlap == 0:
+
+            overlap_words = claim_words & seg_words
+            if not overlap_words:
                 continue
+
+            # Symbolic weighting: higher weight for numbers, formulas, and variable identifiers
+            overlap_score = 0.0
+            for w in overlap_words:
+                if re.search(r"\d|_|[=+#-]", w):
+                    overlap_score += 2.5
+                else:
+                    overlap_score += 1.0
+
             matching_indices.append(idx)
-            score = overlap / (len(seg_words) ** 0.5)
+            score = overlap_score / (len(seg_words) ** 0.5)
             if score > best_score:
                 best_score = score
                 best_idx = idx
@@ -408,13 +433,13 @@ class AuditAdjudicator:
                     audits=[],
                 )
 
-        # 1. Separate meta claims and factual claims for premise resolution
         fallback_corpus = "\n\n---\n\n".join(self._resolve_context_text(v) for v in context_map.values()) if context_map else ""
 
         audits: List[ClaimAudit] = []
-        nli_claims: List[str] = []
-        nli_premises: List[str] = []
-        nli_claim_indices: List[int] = []
+        batch_hypotheses: List[str] = []
+        batch_premises: List[str] = []
+        # Maps batch query index -> (claim_index, sub_clause_index, total_sub_clauses, doc_handle, premise_text)
+        batch_meta: List[Tuple[int, int, int, str, str]] = []
 
         for idx, claim in enumerate(claims):
             if getattr(claim, "is_meta", False):
@@ -433,51 +458,66 @@ class AuditAdjudicator:
             # Determine target document handles for this claim
             doc_handles = list(getattr(claim, "cited_doc_ids", []))
             if not doc_handles and claim.cited_doc_id:
-                # Handle comma-separated or single handle in cited_doc_id
                 doc_handles = [h.strip() for h in re.findall(r"Doc-\d+", claim.cited_doc_id)]
                 if not doc_handles and claim.cited_doc_id in context_map:
                     doc_handles = [claim.cited_doc_id]
 
+            # Multi-Citation Comparative Decomposition:
+            # If claim cites multiple discrete documents and contains comparative conjunctions,
+            # decompose into constituent independent clauses evaluated against corresponding document contexts.
+            if len(doc_handles) > 1 and self._COMPARATIVE_SPLIT_REGEX.search(claim.claim_text):
+                sub_parts = [p.strip() for p in self._COMPARATIVE_SPLIT_REGEX.split(claim.claim_text) if p.strip()]
+                if len(sub_parts) > 1:
+                    for s_idx, part in enumerate(sub_parts):
+                        target_handle = doc_handles[min(s_idx, len(doc_handles) - 1)]
+                        raw_doc_ctx = self._resolve_context_text(context_map.get(target_handle, fallback_corpus))
+                        clean_sub = self._clean_hypothesis_for_nli(part)
+                        p_win = self._extract_premise_window(clean_sub, raw_doc_ctx)
+                        target_premise = p_win if p_win else raw_doc_ctx
+
+                        batch_hypotheses.append(clean_sub)
+                        batch_premises.append(target_premise)
+                        batch_meta.append((idx, s_idx, len(sub_parts), target_handle, target_premise))
+                    continue
+
+            # Standard Single or Unified Multi-Citation evaluation
             if len(doc_handles) > 1:
-                # Multi-Citation Premise Unification:
-                # Extract focused premise window from EACH referenced document and concatenate with delimiter
                 unified_parts = []
                 for handle in doc_handles:
-                    raw_doc_ctx = context_map.get(handle, "")
-                    doc_ctx = self._resolve_context_text(raw_doc_ctx)
-                    if doc_ctx:
-                        p_win = self._extract_premise_window(claim.claim_text, doc_ctx)
-                        unified_parts.append(f"[{handle}]: {p_win or doc_ctx}")
-                if unified_parts:
-                    unified_premise = "\n\n---\n\n".join(unified_parts)
-                    nli_premises.append(unified_premise)
-                else:
-                    nli_premises.append(fallback_corpus)
+                    raw_doc_ctx = self._resolve_context_text(context_map.get(handle, ""))
+                    if raw_doc_ctx:
+                        p_win = self._extract_premise_window(claim.claim_text, raw_doc_ctx)
+                        unified_parts.append(f"[{handle}]: {p_win or raw_doc_ctx}")
+                target_premise = "\n\n---\n\n".join(unified_parts) if unified_parts else fallback_corpus
+                target_handle = ", ".join(doc_handles)
             elif len(doc_handles) == 1:
-                single_handle = doc_handles[0]
-                raw_context = self._resolve_context_text(context_map.get(single_handle, fallback_corpus))
-                premise_window = self._extract_premise_window(claim.claim_text, raw_context)
-                nli_premises.append(premise_window if premise_window else raw_context)
+                target_handle = doc_handles[0]
+                raw_context = self._resolve_context_text(context_map.get(target_handle, fallback_corpus))
+                p_win = self._extract_premise_window(claim.claim_text, raw_context)
+                target_premise = p_win if p_win else raw_context
             else:
+                target_handle = "General"
                 raw_fallback = self._resolve_context_text(fallback_corpus)
-                premise_window = self._extract_premise_window(claim.claim_text, raw_fallback)
-                nli_premises.append(premise_window if premise_window else raw_fallback)
+                p_win = self._extract_premise_window(claim.claim_text, raw_fallback)
+                target_premise = p_win if p_win else raw_fallback
 
-            nli_claims.append(claim.claim_text)
-            nli_claim_indices.append(idx)
+            clean_hyp = self._clean_hypothesis_for_nli(claim.claim_text)
+            batch_hypotheses.append(clean_hyp)
+            batch_premises.append(target_premise)
+            batch_meta.append((idx, 0, 1, target_handle, target_premise))
 
-        # 2. Run batch NLI inference for non-meta claims using cleaned hypotheses
-        if nli_claims:
-            cleaned_nli_claims = [self._clean_hypothesis_for_nli(c) for c in nli_claims]
-            predictions = nli_verifier.predict_batch(claims=cleaned_nli_claims, premises=nli_premises)
-            for claim_idx, premise, pred in zip(nli_claim_indices, nli_premises, predictions):
-                claim = claims[claim_idx]
+        # 2. Run batch NLI inference for non-meta claims
+        if batch_hypotheses:
+            predictions = nli_verifier.predict_batch(claims=batch_hypotheses, premises=batch_premises)
+
+            # Group predictions by claim_index
+            claim_results: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+            for (c_idx, s_idx, total_parts, handle, premise_used), pred in zip(batch_meta, predictions):
                 probs = pred.get("probabilities", {})
                 prob_contra = probs.get("contradiction", 0.0)
                 prob_entail = probs.get("entailment", 0.0)
                 prob_neutral = probs.get("neutral", 0.0)
 
-                # Apply thresholding logic
                 if prob_contra >= self.tau_contradiction:
                     verdict: Literal["ENTAILED", "CONTRADICTION", "NEUTRAL"] = "CONTRADICTION"
                     confidence = prob_contra
@@ -488,14 +528,55 @@ class AuditAdjudicator:
                     verdict = "NEUTRAL"
                     confidence = prob_neutral
 
-                audit = ClaimAudit(
-                    claim_id=claim.claim_id,
-                    claim_text=claim.claim_text,
-                    cited_premise=premise,
-                    probabilities=probs,
-                    verdict=verdict,
-                    confidence=confidence,
-                )
+                claim_results[c_idx].append({
+                    "sub_index": s_idx,
+                    "total_parts": total_parts,
+                    "handle": handle,
+                    "premise": premise_used,
+                    "verdict": verdict,
+                    "confidence": confidence,
+                    "probabilities": probs,
+                })
+
+            for c_idx, sub_res_list in claim_results.items():
+                claim = claims[c_idx]
+                if len(sub_res_list) > 1:
+                    # Multi-clause comparative adjudication:
+                    # ENTAILED if and only if all constituent clauses are ENTAILED
+                    if any(r["verdict"] == "CONTRADICTION" for r in sub_res_list):
+                        final_verdict: Literal["ENTAILED", "CONTRADICTION", "NEUTRAL"] = "CONTRADICTION"
+                        final_conf = max(r["probabilities"].get("contradiction", 0.0) for r in sub_res_list)
+                    elif all(r["verdict"] == "ENTAILED" for r in sub_res_list):
+                        final_verdict = "ENTAILED"
+                        final_conf = min(r["probabilities"].get("entailment", 0.0) for r in sub_res_list)
+                    else:
+                        final_verdict = "NEUTRAL"
+                        final_conf = max(r["probabilities"].get("neutral", 0.0) for r in sub_res_list)
+
+                    combined_premise = "\n\n---\n\n".join(f"[{r['handle']}]: {r['premise']}" for r in sub_res_list)
+                    avg_probs = {
+                        "entailment": sum(r["probabilities"].get("entailment", 0.0) for r in sub_res_list) / len(sub_res_list),
+                        "contradiction": sum(r["probabilities"].get("contradiction", 0.0) for r in sub_res_list) / len(sub_res_list),
+                        "neutral": sum(r["probabilities"].get("neutral", 0.0) for r in sub_res_list) / len(sub_res_list),
+                    }
+                    audit = ClaimAudit(
+                        claim_id=claim.claim_id,
+                        claim_text=claim.claim_text,
+                        cited_premise=combined_premise,
+                        probabilities=avg_probs,
+                        verdict=final_verdict,
+                        confidence=final_conf,
+                    )
+                else:
+                    single_res = sub_res_list[0]
+                    audit = ClaimAudit(
+                        claim_id=claim.claim_id,
+                        claim_text=claim.claim_text,
+                        cited_premise=single_res["premise"],
+                        probabilities=single_res["probabilities"],
+                        verdict=single_res["verdict"],
+                        confidence=single_res["confidence"],
+                    )
                 audits.append(audit)
 
         # Re-sort audits to match the original claim order
@@ -522,3 +603,4 @@ class AuditAdjudicator:
             action=action,
             audits=audits,
         )
+
