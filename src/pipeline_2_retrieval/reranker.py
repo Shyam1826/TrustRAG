@@ -15,6 +15,8 @@ r"""
    - child_chunk_map (dict[str, ChildChunk]): Map of chunk IDs to ChildChunk instances.
    - local_store (LocalStore): Storage instance holding indexed ParentChunk passages.
    - top_k (int): Number of top reranked parent candidates to return (default 5 from config).
+   - doc_filter (str or list[str], optional): Explicit document routing filter.
+   - max_chunks_per_doc (int, optional): Maximum allowed chunks per document during reranking.
 
 3. PROCESS UNDER THE HOOD:
    - Pairs query with each candidate child's text: `[[query, child.text], ...]`.
@@ -25,10 +27,14 @@ r"""
      * Groups resolved parent chunks by `doc_id`.
      * Identifies adjacent neighbor chunks within the same document (consecutive `chunk_index`).
      * Merges adjacent parent passages into unified multi-section context blocks.
-   - Applies Mathematical Document Diversification:
-     * Computes dynamic quota cap `max_chunks_per_source = max(1, top_k // min(num_unique_matching_docs, 3))`.
-     * Selects candidates in descending score order respecting per-document quota limits.
-     * Backfills from remaining highest-scoring candidates if fewer than `top_k` are selected.
+   - Applies Strict Mathematical Document Diversification:
+     * Exception Rule: When a single solitary document is targeted via `doc_filter` (or only 1
+       document exists in candidate set), allow candidates from that document to fill up to `top_k`.
+     * Comparative Intent: Computes proportional dynamic quota `max(1, top_k // min(num_unique_matching_docs, 4))`
+       bounded by `max_chunks_per_doc`.
+     * General Multi-Document Intent: Enforces strict per-document quota ceiling (`max_chunks_per_doc`, default: 3).
+     * Backfill Pass: If quota-based selection produces fewer than `top_k` candidates, backfills from
+       the remaining highest-scoring candidates across all documents until `top_k` is fulfilled.
    - Returns up to `top_k` strictly typed `RetrievalCandidate` models.
 
 4. OUTPUT (OP):
@@ -40,11 +46,12 @@ r"""
    - torch: Tensor operations and device acceleration.
    - src.common.config: Default reranker model name and threshold constants.
    - src.common.schemas: Strict `RetrievalCandidate` and `ChildChunk` schemas.
+   - src.pipeline_2_retrieval.fusion (is_comparative_query): Comparative intent detection.
 ================================================================================
 """
 
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 import torch
 from sentence_transformers import CrossEncoder
 
@@ -87,6 +94,9 @@ class CrossEncoderReranker:
         child_chunk_map: Dict[str, ChildChunk],
         local_store: Any,
         top_k: int = config.thresholds.top_k_rerank,
+        doc_filter: Optional[Union[str, List[str]]] = None,
+        max_chunks_per_doc: Optional[int] = None,
+        is_comparative: Optional[bool] = None,
     ) -> List[RetrievalCandidate]:
         """Rerank candidate children, expand adjacent parent neighbors, and return top context passages.
 
@@ -96,6 +106,9 @@ class CrossEncoderReranker:
             child_chunk_map: Map of child_id to ChildChunk instance.
             local_store: Instance of LocalStore containing parent chunks.
             top_k: Maximum number of deduplicated, expanded parent passages to return.
+            doc_filter: Optional document routing filter to evaluate solitary document scope.
+            max_chunks_per_doc: Optional override for max chunks per document.
+            is_comparative: Optional explicit boolean flag declaring comparative intent.
 
         Returns:
             List of RetrievalCandidate models sorted descending by relevance score.
@@ -192,35 +205,48 @@ class CrossEncoderReranker:
         num_unique_matching_docs = len({cand.doc_id for cand in expanded_candidates})
 
         if getattr(config.retrieval, "enable_document_diversification", True) and num_unique_matching_docs > 1:
-            is_comp = is_comparative_query(query)
-            if is_comp:
-                configured_cap = getattr(config.retrieval, "max_chunks_per_doc", 3)
-                dynamic_quota = max(1, top_k // min(num_unique_matching_docs, 4))
-                max_chunks_per_source = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
-                max_chunks_per_source = max(1, max_chunks_per_source)
-
-                selected: List[RetrievalCandidate] = []
-                doc_counts: Dict[str, int] = defaultdict(int)
-                remaining: List[RetrievalCandidate] = []
-
-                # 1. Quota-based diversification pass
-                for cand in expanded_candidates:
-                    if doc_counts[cand.doc_id] < max_chunks_per_source and len(selected) < top_k:
-                        selected.append(cand)
-                        doc_counts[cand.doc_id] += 1
-                    else:
-                        remaining.append(cand)
-
-                # 2. Backfill from remaining highest-scoring candidates regardless of source
-                if len(selected) < top_k:
-                    for cand in remaining:
-                        if len(selected) >= top_k:
-                            break
-                        selected.append(cand)
-
-                return selected
-            else:
-                # Single-domain/entity query: allow top-matching document to fill context slots without artificial suppression
+            # Exception rule: solitary document targeted by scope router -> no quota suppression
+            if isinstance(doc_filter, str) and doc_filter.strip():
                 return expanded_candidates[:top_k]
+
+            is_comp = (
+                is_comparative
+                if is_comparative is not None
+                else (is_comparative_query(query) if query is not None else True)
+            )
+            configured_cap = (
+                max_chunks_per_doc
+                if max_chunks_per_doc is not None
+                else getattr(config.retrieval, "max_chunks_per_doc", 3)
+            )
+
+            if is_comp:
+                dynamic_quota = max(1, top_k // min(num_unique_matching_docs, 4))
+                effective_quota = min(configured_cap, dynamic_quota) if configured_cap > 0 else dynamic_quota
+            else:
+                effective_quota = configured_cap if configured_cap > 0 else max(1, top_k // min(num_unique_matching_docs, 4))
+
+            effective_quota = max(1, effective_quota)
+
+            selected: List[RetrievalCandidate] = []
+            doc_counts: Dict[str, int] = defaultdict(int)
+            remaining: List[RetrievalCandidate] = []
+
+            # 1. Quota-based diversification pass
+            for cand in expanded_candidates:
+                if doc_counts[cand.doc_id] < effective_quota and len(selected) < top_k:
+                    selected.append(cand)
+                    doc_counts[cand.doc_id] += 1
+                else:
+                    remaining.append(cand)
+
+            # 2. Backfill from remaining highest-scoring candidates regardless of source
+            if len(selected) < top_k:
+                for cand in remaining:
+                    if len(selected) >= top_k:
+                        break
+                    selected.append(cand)
+
+            return selected
 
         return expanded_candidates[:top_k]

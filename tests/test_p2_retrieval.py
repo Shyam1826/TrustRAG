@@ -404,6 +404,107 @@ def test_intent_adaptive_retrieval_diversification():
     assert "ca_1" in comp_cids
 
 
+def test_scope_router_canonical_normalization_and_overlap():
+    """Verify ScopeRouter canonical string normalization, n-gram matching, and token overlap."""
+    from src.pipeline_2_retrieval.router import ScopeRouter
+
+    router = ScopeRouter()
+    known_docs = [
+        "legal/contracts/Consultant_Services_Agreement",
+        "engineering/specs/Attention_Mechanism_Spec",
+        "V_Krishna_Kaushik_CV",
+        "Sanjeev_M_Resume",
+        "karthik",
+        "master_clauses",
+        "operations/SLA_Classifications_Template",
+    ]
+
+    # 1. Exact canonical stem match with spacing and casing differences
+    doc_filter, tokens = router.extract_doc_filter("What does master clauses define for Renewal Term?", known_docs)
+    assert doc_filter == "master_clauses"
+    assert "master" in tokens or "clauses" in tokens
+
+    # 2. Candidate name n-gram inside identifier with prefix/suffix variation
+    doc_filter_kaushik, tokens_k = router.extract_doc_filter("What are the skills of Krishna Kaushik?", known_docs)
+    assert doc_filter_kaushik == "V_Krishna_Kaushik_CV"
+    assert "krishna" in tokens_k or "kaushik" in tokens_k
+
+    # 3. Multi-document comparative query detects matched documents
+    doc_filter_comp, tokens_comp = router.extract_doc_filter("Compare Sanjeev and Karthik technical stack", known_docs)
+    assert isinstance(doc_filter_comp, list)
+    assert set(doc_filter_comp) == {"Sanjeev_M_Resume", "karthik"}
+
+    # 4. Solitary document with folder routing
+    doc_filter_legal, _ = router.extract_doc_filter("Show me the consultant services agreement in legal", known_docs)
+    assert doc_filter_legal == "legal/contracts/Consultant_Services_Agreement"
+
+    # 5. Global unconstrained search query (no doc matches)
+    doc_filter_global, tokens_g = router.extract_doc_filter("What are the applications located in Tokyo?", known_docs)
+    assert doc_filter_global is None
+    assert tokens_g == []
+
+
+def test_fusion_and_reranker_solitary_document_quota_exemption():
+    """Verify that a solitary document targeted by scope router can exceed max_chunks_per_doc up to top_k/top_n."""
+    store = LocalStore(location=":memory:")
+
+    # Create 5 parent chunks for target doc
+    target_parents = [
+        ParentChunk(parent_id=f"p_tgt_{i}", doc_id="doc_target", text=f"Target doc clause {i}", page_number=1, chunk_index=i * 2)
+        for i in range(5)
+    ]
+    # Create 2 parent chunks for other doc
+    other_parents = [
+        ParentChunk(parent_id=f"p_oth_{i}", doc_id="doc_other", text=f"Other doc clause {i}", page_number=1, chunk_index=i * 2)
+        for i in range(2)
+    ]
+    store.store_parents(target_parents + other_parents)
+
+    target_children = [
+        ChildChunk(chunk_id=f"c_tgt_{i}", parent_id=f"p_tgt_{i}", doc_id="doc_target", text=f"Target child {i}", page_number=1, chunk_index=i * 2)
+        for i in range(5)
+    ]
+    other_children = [
+        ChildChunk(chunk_id=f"c_oth_{i}", parent_id=f"p_oth_{i}", doc_id="doc_other", text=f"Other child {i}", page_number=1, chunk_index=i * 2)
+        for i in range(2)
+    ]
+    child_map = {c.chunk_id: c for c in (target_children + other_children)}
+
+    dense_ranks = [(f"c_tgt_{i}", i + 1, 0.99 - i * 0.05) for i in range(5)] + [("c_oth_0", 6, 0.50)]
+    sparse_ranks = [(f"c_tgt_{i}", i + 1, 10.0 - i) for i in range(5)]
+
+    # 1. Test apply_rrf with solitary doc_filter="doc_target": allows 4 chunks (exceeding default quota 3)
+    fused_solitary = apply_rrf(
+        dense_ranks,
+        sparse_ranks,
+        k=60,
+        top_n=4,
+        child_chunk_map=child_map,
+        doc_filter="doc_target",
+        max_chunks_per_doc=3,
+    )
+    assert len(fused_solitary) == 4
+    for cid, _ in fused_solitary:
+        assert child_map[cid].doc_id == "doc_target"
+
+    # 2. Test reranker with solitary doc_filter="doc_target"
+    reranker = CrossEncoderReranker()
+    candidate_cids = [c.chunk_id for c in target_children]
+    resolved = reranker.rerank_and_resolve(
+        query="Target doc clause details",
+        candidate_child_ids=candidate_cids,
+        child_chunk_map=child_map,
+        local_store=store,
+        top_k=4,
+        doc_filter="doc_target",
+        max_chunks_per_doc=3,
+    )
+    assert len(resolved) == 4
+    for cand in resolved:
+        assert cand.doc_id == "doc_target"
+
+
+
 
 
 

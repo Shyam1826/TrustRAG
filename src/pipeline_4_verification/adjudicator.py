@@ -139,7 +139,7 @@ class AuditAdjudicator:
         for _ in range(10):
             prev = cleaned
 
-            # 1. Section Scaffolding
+            # 1. Section Scaffolding & Compound Nested Framing
             cleaned = re.sub(
                 r"^Under\s+[^,;:]+,\s*(?:the\s+documented\s+[^:]+:|the\s+document\s+specifies:)\s*",
                 "",
@@ -148,6 +148,25 @@ class AuditAdjudicator:
             )
             cleaned = re.sub(
                 r"^Under\s+[^,:]+[,:]\s*(?:the\s+(?:candidate|document|specification|item|technologies)\s+(?:completed|specifies|states|utilizes|features|include|utilized\s+include|documented\s+specification\s+or\s+item\s+is|documented\s+items\s+include):?\s*)?",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            # Compound nested "Under <Entity/Document/Section>," framing
+            cleaned = re.sub(
+                r"^Under\s+(?:the\s+)?[A-Za-z0-9_.\s/'-]+?,\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^Pursuant\s+to\s+(?:the\s+)?[A-Za-z0-9_.\s/'-]+?[,:]\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^In\s+accordance\s+with\s+(?:the\s+)?[A-Za-z0-9_.\s/'-]+?[,:]\s*",
                 "",
                 cleaned,
                 flags=re.IGNORECASE,

@@ -1,4 +1,4 @@
-r"""
+"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_3_generation/prompt.py
@@ -16,39 +16,21 @@ r"""
      `src/pipeline_2_retrieval/reranker.py`.
    - draft (str): Previous draft response for self-correction.
    - failed_claims (list[str]): List of unverified or contradictory claims to remove/correct.
+   - max_context_chars (int): Hard safety ceiling on total character count across context
+     passages to guarantee provider rate-limit and token-budget compliance.
 
 3. PROCESS UNDER THE HOOD:
    - Formats each candidate into an XML document block with sequential citation IDs:
      <document id="Doc-1" doc_id="doc_1" page="1">...</document>
    - Enforces 6 fundamental operational rules:
-     * Rule 1 (Strict Semantic Grounding & Closed-World Assumption):
-       - Context passages are organized into labeled sections: `[Document: ... | Section: ...]`.
-       - LLM acts as an evidence-grounded synthesizer with ZERO external parametric memory.
-       - State ONLY positive facts explicitly asserted in <context>.
-       - NEVER output negative meta-commentary about missing facts (do not state "The text does not mention X").
-       - Attribute statements only to their explicit sections and source documents.
-       - Verbatim Accuracy: Do NOT expand abbreviations or acronyms.
-       - Structure comparative and cross-document questions as parallel factual assertions with explicit [Doc-X] tags.
-     * Rule 2 (Strict Attribute Isolation & Anti-Bundle Enforcement):
-       - List ONLY specific attributes, libraries, tools, frameworks, and specifications
-         that are explicitly written inside the <context> tags for each respective entry.
-       - NEVER infer, deduce, or extrapolate unmentioned components from general training knowledge.
-     * Rule 3 (Strict Inventory & Entity Grounding):
-       - When asked to list or categorize specific entities, technologies, tools, databases, or specifications:
-         * Include ONLY items that appear VERBATIM in <context>.
-         * Do NOT extrapolate, summarize, or introduce common category companions.
-         * If a requested entity category has only one matching item in the text, report only that single item.
-     * Rule 4 (Structured Atomic Bullets & Verbatim Source Fidelity):
-       - Exhaustively list all relevant facts, specifications, or items as concise bullet points.
-       - Formulate assertions as complete, self-contained grammatical sentences connecting entity and attribute.
-       - If an item is listed only as a title or name, output ONLY that title verbatim.
-     * Rule 5 (ASCII Inline Citations):
-       - Append standard ASCII square brackets like [Doc-1] or [Doc-2] to every factual assertion and comparative clause.
-       - Forbids Unicode or full-width brackets (【Doc-X】).
-     * Rule 6 (Grounded Partial Coverage & Strict Fallback):
-       - Answers as much of the query as can be directly and affirmatively proven from <context>.
-       - Replaces all-or-nothing blockage: synthesizes supported sub-questions instead of discarding all facts.
-       - Emits fallback string ONLY if zero relevant information exists across all provided context.
+     * Rule 1 (Strict Semantic Grounding & Closed-World Assumption)
+     * Rule 2 (Strict Attribute Isolation & Anti-Bundle Enforcement)
+     * Rule 3 (Strict Inventory & Entity Grounding)
+     * Rule 4 (Structured Atomic Bullets & Verbatim Source Fidelity)
+     * Rule 5 (ASCII Inline Citations)
+     * Rule 6 (Grounded Partial Coverage & Strict Fallback)
+   - Truncates context passages dynamically if total character count exceeds `max_context_chars`,
+     ensuring highest-ranking reranked candidates take precedence without breaking provider ITPM ceilings.
    - `build_correction_prompt()`: Generates a corrective prompt passing the failed claims, draft,
      and context to produce a 100% verified rewrite without throwing away validly grounded points.
 
@@ -68,31 +50,42 @@ from src.common.schemas import RetrievalCandidate
 FALLBACK_INSUFFICIENT_INFO = (
     "The provided documentation does not contain sufficient information to answer."
 )
+DEFAULT_MAX_CONTEXT_CHARS = 12000
 
 
-def build_rag_prompt(query: str, contexts: List[RetrievalCandidate]) -> str:
-    """Construct an XML-delimited, taxonomy-strict RAG prompt.
+def build_rag_prompt(
+    query: str,
+    contexts: List[RetrievalCandidate],
+    max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+) -> str:
+    """Construct an XML-delimited, taxonomy-strict RAG prompt bounded by a character budget.
 
     Args:
         query: Target user query.
         contexts: List of top reranked RetrievalCandidate passages.
+        max_context_chars: Maximum character limit for the aggregated context block.
 
     Returns:
         Structured prompt string.
     """
-    # 1. Format context documents
     context_blocks: List[str] = []
+    current_char_count = 0
+
     for idx, candidate in enumerate(contexts, start=1):
+        clean_text = candidate.text.strip()
         doc_xml = (
             f'  <document id="Doc-{idx}" doc_id="{candidate.doc_id}" page="{candidate.page_number}">\n'
-            f"    {candidate.text.strip()}\n"
+            f"    {clean_text}\n"
             f"  </document>"
         )
+        # Enforce budget guard: stop appending if we exceed the budget and have at least 2 passages
+        if current_char_count + len(doc_xml) > max_context_chars and idx > 2:
+            break
         context_blocks.append(doc_xml)
+        current_char_count += len(doc_xml)
 
     joined_context = "\n".join(context_blocks)
 
-    # 2. Assemble prompt template
     prompt = (
         "You are an enterprise AI assistant adhering to strict verification, taxonomy, and truthfulness standards.\n\n"
         "### OPERATIONAL RULES:\n"
@@ -110,12 +103,12 @@ def build_rag_prompt(query: str, contexts: List[RetrievalCandidate]) -> str:
         "     * Avoid ungrounded contrastive meta-commentary about what is NOT present in the other document; state ONLY the positive documented facts for each source.\n"
         "2. (Strict Attribute Isolation & Anti-Bundle Enforcement):\n"
         "   - You must list ONLY the specific attributes, libraries, tools, frameworks, and specifications that are explicitly written inside the <context> tags for each respective entry.\n"
-        "   - NEVER infer, deduce, or extrapolate unmentioned components from general training knowledge (for example, do not auto-complete a single mentioned library into a full multi-tier stack, suite, or architecture unless every single component is explicitly named in that specific source passage).\n"
+        "   - NEVER infer, deduce, or extrapolate unmentioned components from general training knowledge.\n"
         "   - If an architecture, backend, or operational parameter is not explicitly detailed in the text, leave it unmentioned—do NOT fill gaps using common industry conventions.\n"
         "3. (Strict Inventory & Entity Grounding):\n"
         "   - When asked to list or categorize specific entities, technologies, tools, databases, or specifications across documents:\n"
         "     * Include ONLY items that appear VERBATIM in <context>.\n"
-        "     * Do NOT extrapolate, summarize, or introduce common category companions (e.g., do not output PostgreSQL or MySQL unless the exact words 'PostgreSQL' or 'MySQL' exist in the retrieved passages).\n"
+        "     * Do NOT extrapolate, summarize, or introduce common category companions.\n"
         "     * If a requested entity category has only one matching item in the text, report only that single item.\n"
         "4. (Structured Atomic Bullets & Verbatim Source Fidelity):\n"
         "   - Exhaustively list all relevant facts, specifications, items, or properties mentioned in <context>.\n"
@@ -146,6 +139,7 @@ def build_correction_prompt(
     context: Union[str, List[RetrievalCandidate]],
     draft: str,
     failed_claims: List[str],
+    max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
 ) -> str:
     """Construct an automated corrective rewrite prompt instructing the model to remove unverified claims.
 
@@ -154,22 +148,28 @@ def build_correction_prompt(
         context: Retrieved context text or list of RetrievalCandidate instances.
         draft: Initial synthesized draft response containing unverified assertions.
         failed_claims: List of specific claim strings that failed NLI verification.
+        max_context_chars: Maximum character limit for the aggregated context block.
 
     Returns:
         Structured self-correction prompt string.
     """
     if isinstance(context, list):
         context_blocks = []
+        current_char_count = 0
         for idx, candidate in enumerate(context, start=1):
+            clean_text = candidate.text.strip()
             doc_xml = (
                 f'  <document id="Doc-{idx}" doc_id="{candidate.doc_id}" page="{candidate.page_number}">\n'
-                f"    {candidate.text.strip()}\n"
+                f"    {clean_text}\n"
                 f"  </document>"
             )
+            if current_char_count + len(doc_xml) > max_context_chars and idx > 2:
+                break
             context_blocks.append(doc_xml)
+            current_char_count += len(doc_xml)
         joined_context = "\n".join(context_blocks)
     else:
-        joined_context = str(context).strip()
+        joined_context = str(context).strip()[:max_context_chars]
 
     failed_list_str = "\n".join(f"- {c}" for c in failed_claims) if failed_claims else "- None"
 

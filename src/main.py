@@ -76,6 +76,8 @@ from src.pipeline_3_generation.prompt import build_correction_prompt, build_rag_
 from src.pipeline_4_verification.adjudicator import AuditAdjudicator
 from src.pipeline_4_verification.claim_extractor import AtomicClaimExtractor
 from src.pipeline_4_verification.nli_model import DebertaNLIVerifier
+from src.pipeline_5_self_correction.corrector import SelfCorrector
+from src.pipeline_5_self_correction.decomposer import QueryDecomposer
 
 
 SUPPORTED_DOCUMENT_EXTENSIONS: Set[str] = set(config.ingestion.supported_extensions)
@@ -126,6 +128,10 @@ class TrustRAGPipeline:
         self.claim_extractor = AtomicClaimExtractor()
         self.nli_verifier = DebertaNLIVerifier()
         self.adjudicator = AuditAdjudicator()
+
+        # Pipeline 5: Self-Correction & Sub-Query Decomposition
+        self.decomposer = QueryDecomposer()
+        self.corrector = SelfCorrector()
 
     def _extract_entity_aliases(self, pages: List[Dict], assigned_doc_id: str) -> List[str]:
         """Extract candidate entity identifiers and document aliases using domain-agnostic NLP filtering."""
@@ -372,41 +378,81 @@ class TrustRAGPipeline:
                 audits=[],
             )
 
-        # 1. Query Preprocessing & Dynamic Folder/Scope Routing
-        doc_filter, matched_entities = self.rewriter.extract_doc_filter(
-            user_query,
-            list(self.known_doc_ids),
-            doc_entity_map=self.doc_entity_map,
-        )
-        clean_query = self.rewriter.transform(user_query, entities_to_strip=matched_entities)
-        if doc_filter:
-            if isinstance(doc_filter, list):
-                print(f"[Scope Router] Scoping retrieval to documents: {doc_filter} (directives: {matched_entities})")
-            else:
-                print(f"[Scope Router] Scoping retrieval to document: '{doc_filter}' (directives: {matched_entities})")
-
-        # 2. Parallel Dense and Sparse Retrieval
+        # 1. Multi-Faceted Query Decomposition & Dynamic Scope Routing
+        sub_queries = self.decomposer.decompose(user_query)
         top_k_dense = config.retrieval.top_k_dense
-        query_tokens = [t.lower() for t in clean_query.split() if t.strip()]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_dense = executor.submit(
-                retrieve_dense,
-                clean_query,
-                self.embedder,
-                self.local_store.client,
-                top_k=top_k_dense,
-                doc_filter=doc_filter,
-            )
-            future_sparse = executor.submit(
-                self.bm25_searcher.search if self.bm25_searcher else lambda *args, **kwargs: [],
-                query_tokens,
-                top_k=top_k_dense,
-                doc_filter=doc_filter,
-            )
+        dense_results: List[Tuple[str, int, float]] = []
+        sparse_results: List[Tuple[str, int, float]] = []
+        resolved_doc_filter: Optional[Union[str, List[str]]] = None
 
-            dense_results = future_dense.result()
-            sparse_results = future_sparse.result()
+        if len(sub_queries) > 1:
+            all_dense_ranks: List[Tuple[str, int, float]] = []
+            all_sparse_ranks: List[Tuple[str, int, float]] = []
+
+            for sub_q in sub_queries:
+                sub_doc_filter, sub_matched_entities = self.rewriter.extract_doc_filter(
+                    sub_q,
+                    list(self.known_doc_ids),
+                    doc_entity_map=self.doc_entity_map,
+                )
+                sub_clean_q = self.rewriter.transform(sub_q, entities_to_strip=sub_matched_entities)
+                sub_tokens = [t.lower() for t in sub_clean_q.split() if t.strip()]
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    fut_dense = executor.submit(
+                        retrieve_dense,
+                        sub_clean_q,
+                        self.embedder,
+                        self.local_store.client,
+                        top_k=top_k_dense,
+                        doc_filter=sub_doc_filter,
+                    )
+                    fut_sparse = executor.submit(
+                        self.bm25_searcher.search if self.bm25_searcher else lambda *args, **kwargs: [],
+                        sub_tokens,
+                        top_k=top_k_dense,
+                        doc_filter=sub_doc_filter,
+                    )
+                    all_dense_ranks.extend(fut_dense.result())
+                    all_sparse_ranks.extend(fut_sparse.result())
+
+            dense_results = all_dense_ranks
+            sparse_results = all_sparse_ranks
+            clean_query = self.rewriter.transform(user_query)
+            resolved_doc_filter = None
+        else:
+            doc_filter, matched_entities = self.rewriter.extract_doc_filter(
+                user_query,
+                list(self.known_doc_ids),
+                doc_entity_map=self.doc_entity_map,
+            )
+            clean_query = self.rewriter.transform(user_query, entities_to_strip=matched_entities)
+            resolved_doc_filter = doc_filter
+            if doc_filter:
+                if isinstance(doc_filter, list):
+                    print(f"[Scope Router] Scoping retrieval to documents: {doc_filter} (directives: {matched_entities})")
+                else:
+                    print(f"[Scope Router] Scoping retrieval to document: '{doc_filter}' (directives: {matched_entities})")
+
+            query_tokens = [t.lower() for t in clean_query.split() if t.strip()]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                future_dense = executor.submit(
+                    retrieve_dense,
+                    clean_query,
+                    self.embedder,
+                    self.local_store.client,
+                    top_k=top_k_dense,
+                    doc_filter=doc_filter,
+                )
+                future_sparse = executor.submit(
+                    self.bm25_searcher.search if self.bm25_searcher else lambda *args, **kwargs: [],
+                    query_tokens,
+                    top_k=top_k_dense,
+                    doc_filter=doc_filter,
+                )
+                dense_results = future_dense.result()
+                sparse_results = future_sparse.result()
 
         # 3. Reciprocal Rank Fusion with Intent-Adaptive Diversification
         fused_candidates = apply_rrf(
@@ -416,6 +462,7 @@ class TrustRAGPipeline:
             top_n=top_k_dense,
             child_chunk_map=self.child_chunk_map,
             query=clean_query,
+            doc_filter=resolved_doc_filter,
         )
         candidate_cids = [cid for cid, _ in fused_candidates]
 
@@ -426,6 +473,7 @@ class TrustRAGPipeline:
             child_chunk_map=self.child_chunk_map,
             local_store=self.local_store,
             top_k=config.retrieval.top_k_rerank,
+            doc_filter=resolved_doc_filter,
         )
         self.last_retrieved_contexts = top_contexts
 
@@ -459,39 +507,19 @@ class TrustRAGPipeline:
             draft_text=draft_text,
         )
 
-        # 11. Automated Self-Correction Rewrite Loop (1-pass)
-        if audit_report.action in ("WARN", "TRIGGER_REWRITE") or audit_report.has_contradiction or audit_report.faithfulness_score < config.verification.tau_entailment:
-            failed_claims = [
-                a.claim_text for a in audit_report.audits
-                if a.verdict != "ENTAILED"
-            ]
-            if failed_claims:
-                print(f"[Self-Correction] Triggered 1-pass corrective rewrite for {len(failed_claims)} unverified claims.")
-                correction_prompt = build_correction_prompt(
-                    query=user_query.strip(),
-                    context=top_contexts,
-                    draft=draft_text,
-                    failed_claims=failed_claims,
-                )
-                corrected_draft_text = self.generator.generate(correction_prompt)
-                corrected_draft = validate_and_parse_citations(
-                    draft_text=corrected_draft_text,
-                    max_valid_doc_id=len(top_contexts),
-                )
-                corrected_claims = self.claim_extractor.extract_claims(
-                    corrected_draft,
-                    default_section=default_section,
-                )
-                corrected_report = self.adjudicator.adjudicate(
-                    claims=corrected_claims,
-                    context_map=context_map,
-                    nli_verifier=self.nli_verifier,
-                    draft_text=corrected_draft_text,
-                )
-                if corrected_report.faithfulness_score > audit_report.faithfulness_score:
-                    audit_report = corrected_report
-                elif corrected_report.faithfulness_score == audit_report.faithfulness_score and not corrected_report.has_contradiction and audit_report.has_contradiction:
-                    audit_report = corrected_report
+        # 11. Automated Self-Correction Rewrite Loop (1-pass) with Selective Claim Pruning
+        audit_report = self.corrector.correct(
+            query=user_query,
+            draft_text=draft_text,
+            audit_report=audit_report,
+            top_contexts=top_contexts,
+            generator=self.generator,
+            claim_extractor=self.claim_extractor,
+            adjudicator=self.adjudicator,
+            nli_verifier=self.nli_verifier,
+            context_map=context_map,
+            default_section=default_section,
+        )
 
         return audit_report
 
