@@ -75,6 +75,9 @@ from src.pipeline_1_ingestion.manifest import IngestionManifest
 from src.pipeline_1_ingestion.parser import extract_pdf_pages
 from src.pipeline_1_ingestion.reader import read_document
 from src.pipeline_1_ingestion.tabular_store import TabularStore
+from src.database.connection import init_db
+from src.database.repository import DatabaseRepository
+from src.pipeline_2_retrieval.conversational_rewriter import ConversationalQueryRewriter
 from src.pipeline_2_retrieval.fusion import apply_rrf, is_comparative_query
 from src.pipeline_2_retrieval.reranker import CrossEncoderReranker
 from src.pipeline_2_retrieval.rewriter import QueryTransformer
@@ -103,6 +106,7 @@ class TrustRAGPipeline:
         qdrant_location: Optional[str] = None,
         qdrant_path: Optional[str] = None,
         manifest: Optional[IngestionManifest] = None,
+        db_repo: Optional[DatabaseRepository] = None,
     ) -> None:
         """Initialize all pipeline components and models.
 
@@ -111,6 +115,7 @@ class TrustRAGPipeline:
             qdrant_location: Optional Qdrant database location (e.g. ':memory:' or remote URL).
             qdrant_path: Optional on-disk directory path for local Qdrant storage (default: 'data/qdrant_db').
             manifest: Optional IngestionManifest instance for incremental tracking.
+            db_repo: Optional DatabaseRepository instance for chat session persistence.
         """
         # Pipeline 1: Ingestion & Storage
         self.manifest = manifest or IngestionManifest()
@@ -152,6 +157,13 @@ class TrustRAGPipeline:
         # Pipeline 5: Self-Correction & Sub-Query Decomposition
         self.decomposer = QueryDecomposer()
         self.corrector = SelfCorrector()
+
+        # Database Ledger & Multi-Turn Persistence
+        init_db()
+        self.db_repo = db_repo or DatabaseRepository()
+
+        # Conversational Query Reformulation
+        self.conversational_rewriter = ConversationalQueryRewriter(generator=self.generator)
 
     def _extract_entity_aliases(self, pages: List[Dict], assigned_doc_id: str) -> List[str]:
         """Extract candidate entity identifiers and document aliases using domain-agnostic NLP filtering."""
@@ -789,6 +801,90 @@ class TrustRAGPipeline:
         )
 
         return audit_report
+
+    def chat(
+        self,
+        user_query: str,
+        user_id: str,
+        thread_id: str,
+    ) -> TrustAuditReport:
+        """Process a conversational multi-turn query with coreference reformulation and ledger persistence.
+
+        Args:
+            user_query: Natural language query or follow-up from user.
+            user_id: Tenant user identifier.
+            thread_id: Conversational thread session identifier.
+
+        Returns:
+            TrustAuditReport containing draft text, per-claim audits, and safety action.
+
+        Raises:
+            ValueError: If user_id or thread_id is missing or empty.
+        """
+        if not user_id or not str(user_id).strip():
+            raise ValueError("user_id must be provided for conversational chat.")
+        if not thread_id or not str(thread_id).strip():
+            raise ValueError("thread_id must be provided for conversational chat.")
+
+        clean_user_id = str(user_id).strip()
+        clean_thread_id = str(thread_id).strip()
+
+        if not user_query or not user_query.strip():
+            return TrustAuditReport(
+                draft_text="",
+                faithfulness_score=1.0,
+                has_contradiction=False,
+                action="PASS",
+                audits=[],
+            )
+
+        # 1. Ensure user and thread exist in database ledger
+        user = self.db_repo.get_user_by_id(clean_user_id)
+        if not user:
+            user = self.db_repo.create_user(
+                email=f"{clean_user_id}@tenant.trustrag",
+                password="tenant_default_password",
+                full_name=f"Tenant {clean_user_id}",
+                user_id=clean_user_id,
+            )
+
+        thread = self.db_repo.get_thread(clean_thread_id, clean_user_id)
+        if not thread:
+            thread = self.db_repo.create_thread(
+                user_id=clean_user_id,
+                title=user_query[:50],
+                thread_id=clean_thread_id,
+            )
+
+        # 2. Fetch recent message history for thread_id
+        raw_messages = self.db_repo.get_thread_messages(clean_thread_id, clean_user_id, limit=6)
+        chat_history = [{"role": m.role, "content": m.content} for m in raw_messages]
+
+        # 3. Log the incoming user message
+        self.db_repo.add_message(
+            thread_id=clean_thread_id,
+            user_id=clean_user_id,
+            role="user",
+            content=user_query,
+        )
+
+        # 4. Invoke ConversationalQueryRewriter to produce standalone search query
+        standalone_query = self.conversational_rewriter.rewrite_query(user_query, chat_history)
+
+        # 5. Execute unified retrieval, prompt construction, and verification via ask()
+        report = self.ask(standalone_query, user_id=clean_user_id, thread_id=clean_thread_id)
+
+        # 6. Log final assistant response and its full audit report into database ledger
+        self.db_repo.add_message(
+            thread_id=clean_thread_id,
+            user_id=clean_user_id,
+            role="assistant",
+            content=report.draft_text,
+            citations=self.last_retrieved_contexts,
+            audit_report=report,
+        )
+
+        return report
 
     def close(self) -> None:
         """Close storage handles and clean up pipeline resources."""

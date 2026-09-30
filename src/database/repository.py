@@ -87,6 +87,7 @@ class DatabaseRepository:
         password: str,
         full_name: Optional[str] = None,
         is_active: bool = True,
+        user_id: Optional[str] = None,
         session: Optional[Session] = None,
     ) -> User:
         """Create and persist a new user account with hashed credentials.
@@ -96,6 +97,7 @@ class DatabaseRepository:
             password: Plaintext password string.
             full_name: Optional full name or display name.
             is_active: Account status flag.
+            user_id: Optional custom user ID string.
             session: Optional active database session.
 
         Returns:
@@ -117,12 +119,15 @@ class DatabaseRepository:
                 raise ValueError(f"User with email '{clean_email}' already exists.")
 
             hashed_pw = hash_password(password)
-            user = User(
-                email=clean_email,
-                hashed_password=hashed_pw,
-                full_name=full_name.strip() if full_name else None,
-                is_active=is_active,
-            )
+            user_kwargs = {
+                "email": clean_email,
+                "hashed_password": hashed_pw,
+                "full_name": full_name.strip() if full_name else None,
+                "is_active": is_active,
+            }
+            if user_id:
+                user_kwargs["id"] = str(user_id)
+            user = User(**user_kwargs)
             s.add(user)
             s.flush()
             s.refresh(user)
@@ -238,6 +243,7 @@ class DatabaseRepository:
         self,
         user_id: str,
         title: str = "New Chat",
+        thread_id: Optional[str] = None,
         session: Optional[Session] = None,
     ) -> ChatThread:
         """Create a new conversational chat thread for an authenticated user.
@@ -245,6 +251,7 @@ class DatabaseRepository:
         Args:
             user_id: UUID of the owning user.
             title: Display title for the thread.
+            thread_id: Optional custom thread ID string.
             session: Optional active database session.
 
         Returns:
@@ -258,10 +265,13 @@ class DatabaseRepository:
             if not s.execute(stmt).scalar_one_or_none():
                 raise ValueError(f"User with id '{user_id}' does not exist.")
 
-            thread = ChatThread(
-                user_id=str(user_id),
-                title=title.strip() if title else "New Chat",
-            )
+            thread_kwargs = {
+                "user_id": str(user_id),
+                "title": title.strip() if title else "New Chat",
+            }
+            if thread_id:
+                thread_kwargs["id"] = str(thread_id)
+            thread = ChatThread(**thread_kwargs)
             s.add(thread)
             s.flush()
             s.refresh(thread)
