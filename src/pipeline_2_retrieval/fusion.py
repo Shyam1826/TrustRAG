@@ -88,6 +88,8 @@ def apply_rrf(
     query: Optional[str] = None,
     is_comparative: Optional[bool] = None,
     doc_filter: Optional[Union[str, List[str]]] = None,
+    user_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> List[Tuple[str, float]]:
     """Combine dense and sparse ranked lists using Reciprocal Rank Fusion (RRF) with strict diversification quotas.
 
@@ -104,6 +106,8 @@ def apply_rrf(
         query: Optional user query string for intent-adaptive allocation.
         is_comparative: Optional explicit boolean flag declaring comparative intent.
         doc_filter: Optional document routing filter to evaluate solitary document scope.
+        user_id: Optional tenant user_id filter.
+        thread_id: Optional tenant thread_id filter.
 
     Returns:
         List of tuples sorted descending by RRF score: [(child_id, rrf_score), ...].
@@ -124,6 +128,18 @@ def apply_rrf(
         key=lambda item: item[1],
         reverse=True,
     )
+
+    # Filter by tenant coordinates if child_chunk_map is provided
+    if child_chunk_map and user_id is not None:
+        sorted_candidates = [
+            item for item in sorted_candidates
+            if item[0] not in child_chunk_map or getattr(child_chunk_map[item[0]], "user_id", None) == user_id
+        ]
+    if child_chunk_map and thread_id is not None:
+        sorted_candidates = [
+            item for item in sorted_candidates
+            if item[0] not in child_chunk_map or getattr(child_chunk_map[item[0]], "thread_id", None) == thread_id
+        ]
 
     # Apply strict document diversification if child_chunk_map is provided
     if child_chunk_map and getattr(config.retrieval, "enable_document_diversification", True):

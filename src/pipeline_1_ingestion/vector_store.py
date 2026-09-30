@@ -141,13 +141,18 @@ class QdrantVectorStore:
             if chunk.vector is None:
                 raise ValueError(f"ChildChunk {chunk.chunk_id} missing dense vector embedding.")
 
-            # Generate deterministic UUID from chunk_id
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk.chunk_id))
-
             # Hydrate parent text from store if available
             parent = self._parent_store.get(chunk.parent_id)
             parent_text = parent.text if parent else getattr(chunk, "text", "")
             section_path = getattr(chunk, "section_name", "General")
+
+            # Resolve tenant coordinates
+            user_id = getattr(chunk, "user_id", None) or (getattr(parent, "user_id", None) if parent else None)
+            thread_id = getattr(chunk, "thread_id", None) or (getattr(parent, "thread_id", None) if parent else None)
+
+            # Generate deterministic UUID from chunk_id (namespaced by tenant if present)
+            point_seed = f"{user_id}:{thread_id}:{chunk.chunk_id}" if user_id else chunk.chunk_id
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, point_seed))
 
             # Resolve relative_path and folder_hierarchy
             relative_path = getattr(chunk, "relative_path", None)
@@ -181,6 +186,8 @@ class QdrantVectorStore:
                 "chunk_index": getattr(chunk, "chunk_index", 0),
                 "relative_path": relative_path,
                 "folder_hierarchy": folder_hierarchy,
+                "user_id": user_id,
+                "thread_id": thread_id,
             }
 
             points.append(
@@ -220,38 +227,68 @@ class QdrantVectorStore:
         """
         return self._parent_store.get(parent_id)
 
-    def delete_document(self, doc_id: str) -> None:
+    def delete_document(
+        self,
+        doc_id: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> None:
         """Delete all points matching doc_id from Qdrant and clear associated parents from cache.
 
         Args:
             doc_id: Unique document identifier to remove.
+            user_id: Optional tenant user_id filter.
+            thread_id: Optional tenant thread_id filter.
         """
         if not doc_id:
             return
 
-        delete_filter = models.Filter(
-            must=[
+        must_conditions: List[models.Condition] = [
+            models.FieldCondition(
+                key="doc_id",
+                match=models.MatchValue(value=doc_id.strip()),
+            )
+        ]
+        if user_id is not None:
+            must_conditions.append(
                 models.FieldCondition(
-                    key="doc_id",
-                    match=models.MatchValue(value=doc_id.strip()),
+                    key="user_id",
+                    match=models.MatchValue(value=user_id),
                 )
-            ]
-        )
+            )
+        if thread_id is not None:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="thread_id",
+                    match=models.MatchValue(value=thread_id),
+                )
+            )
+
+        delete_filter = models.Filter(must=must_conditions)
         self.client.delete(
             collection_name=self.collection_name,
             points_selector=models.FilterSelector(filter=delete_filter),
         )
 
-        # Clear parent cache entries matching doc_id
+        # Clear parent cache entries matching doc_id (and tenant if applicable)
         parent_keys_to_delete = [
             pid for pid, parent in self._parent_store.items()
             if getattr(parent, "doc_id", "") == doc_id
+            and (user_id is None or getattr(parent, "user_id", None) == user_id)
         ]
         for pid in parent_keys_to_delete:
             self._parent_store.pop(pid, None)
 
-    def load_all_child_chunks(self) -> List[ChildChunk]:
+    def load_all_child_chunks(
+        self,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> List[ChildChunk]:
         """Scroll all indexed points from Qdrant, hydrate parent store, and return ChildChunk instances.
+
+        Args:
+            user_id: Optional tenant user_id filter.
+            thread_id: Optional tenant thread_id filter.
 
         Returns:
             List of reconstructed ChildChunk models from persistent vector store.
@@ -259,9 +296,29 @@ class QdrantVectorStore:
         all_chunks: List[ChildChunk] = []
         offset = None
 
+        scroll_filter = None
+        must_conditions: List[models.Condition] = []
+        if user_id is not None:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="user_id",
+                    match=models.MatchValue(value=user_id),
+                )
+            )
+        if thread_id is not None:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="thread_id",
+                    match=models.MatchValue(value=thread_id),
+                )
+            )
+        if must_conditions:
+            scroll_filter = models.Filter(must=must_conditions)
+
         while True:
             scroll_result, next_offset = self.client.scroll(
                 collection_name=self.collection_name,
+                scroll_filter=scroll_filter,
                 limit=10000,
                 offset=offset,
                 with_payload=True,
@@ -280,6 +337,8 @@ class QdrantVectorStore:
                 relative_path = payload.get("relative_path")
                 folder_hierarchy = payload.get("folder_hierarchy")
                 sparse_tokens = payload.get("sparse_tokens")
+                pt_user_id = payload.get("user_id")
+                pt_thread_id = payload.get("thread_id")
 
                 chunk = ChildChunk(
                     chunk_id=chunk_id,
@@ -293,6 +352,8 @@ class QdrantVectorStore:
                     section_name=section_name,
                     relative_path=relative_path,
                     folder_hierarchy=folder_hierarchy,
+                    user_id=pt_user_id,
+                    thread_id=pt_thread_id,
                 )
                 all_chunks.append(chunk)
 
@@ -310,6 +371,8 @@ class QdrantVectorStore:
                             section_name=section_name,
                             relative_path=relative_path,
                             folder_hierarchy=folder_hierarchy,
+                            user_id=pt_user_id,
+                            thread_id=pt_thread_id,
                         )
                     else:
                         if chunk_id not in self._parent_store[parent_id].child_ids:
@@ -326,54 +389,72 @@ class QdrantVectorStore:
         query_vector: List[float],
         limit: int = 20,
         doc_filter: Optional[Union[str, List[str]]] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Search nearest neighbors with native payload filtering.
+        """Search nearest neighbors with native payload filtering including tenant isolation.
 
         Args:
             query_vector: Dense embedding vector for query.
             limit: Maximum points to retrieve.
             doc_filter: Optional single doc_id string or list of doc_ids.
+            user_id: Optional tenant user_id filter.
+            thread_id: Optional tenant thread_id filter.
+            top_k: Optional alias for limit.
 
         Returns:
             List of result dictionaries containing scores and hydrated payloads.
         """
-        query_filter: Optional[models.Filter] = None
+        effective_limit = top_k if top_k is not None else limit
+        must_conditions: List[models.Condition] = []
+
+        if user_id is not None:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="user_id",
+                    match=models.MatchValue(value=user_id),
+                )
+            )
+        if thread_id is not None:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="thread_id",
+                    match=models.MatchValue(value=thread_id),
+                )
+            )
 
         if isinstance(doc_filter, str) and doc_filter.strip():
-            query_filter = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="doc_id",
-                        match=models.MatchValue(value=doc_filter.strip()),
-                    )
-                ]
+            must_conditions.append(
+                models.FieldCondition(
+                    key="doc_id",
+                    match=models.MatchValue(value=doc_filter.strip()),
+                )
             )
         elif isinstance(doc_filter, list) and len(doc_filter) > 0:
             clean_filters = [d.strip() for d in doc_filter if isinstance(d, str) and d.strip()]
             if len(clean_filters) == 1:
-                query_filter = models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="doc_id",
-                            match=models.MatchValue(value=clean_filters[0]),
-                        )
-                    ]
+                must_conditions.append(
+                    models.FieldCondition(
+                        key="doc_id",
+                        match=models.MatchValue(value=clean_filters[0]),
+                    )
                 )
             elif len(clean_filters) > 1:
-                query_filter = models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="doc_id",
-                            match=models.MatchAny(any=clean_filters),
-                        )
-                    ]
+                must_conditions.append(
+                    models.FieldCondition(
+                        key="doc_id",
+                        match=models.MatchAny(any=clean_filters),
+                    )
                 )
+
+        query_filter: Optional[models.Filter] = models.Filter(must=must_conditions) if must_conditions else None
 
         search_results = self.client.search(
             collection_name=self.collection_name,
             query_vector=query_vector,
             query_filter=query_filter,
-            limit=limit,
+            limit=effective_limit,
             with_payload=True,
         )
 
@@ -394,6 +475,8 @@ class QdrantVectorStore:
                     "chunk_index": payload.get("chunk_index", 0),
                     "relative_path": payload.get("relative_path", ""),
                     "folder_hierarchy": payload.get("folder_hierarchy", []),
+                    "user_id": payload.get("user_id"),
+                    "thread_id": payload.get("thread_id"),
                     "payload": payload,
                 }
             )

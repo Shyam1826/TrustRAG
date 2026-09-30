@@ -83,11 +83,18 @@ class TabularQueryEngine:
         self.tabular_store = tabular_store
         self.generator = generator
 
-    def is_tabular_query(self, query: str) -> bool:
+    def is_tabular_query(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> bool:
         """Determine if a query targets structured tabular data and relational operations.
 
         Args:
             query: User search query or sub-query string.
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             True if query targets a registered table and contains relational filtering markers.
@@ -95,11 +102,11 @@ class TabularQueryEngine:
         if not query or not query.strip():
             return False
 
-        table_names = self.tabular_store.get_table_names()
+        table_names = self.tabular_store.get_table_names(user_id=user_id, thread_id=thread_id)
         if not table_names:
             return False
 
-        target_table = self.detect_target_table(query)
+        target_table = self.detect_target_table(query, user_id=user_id, thread_id=thread_id)
         if not target_table:
             return False
 
@@ -108,7 +115,7 @@ class TabularQueryEngine:
             return True
 
         # Check if table is explicitly named and query mentions columns
-        schemas = self.tabular_store.get_table_schemas()
+        schemas = self.tabular_store.get_table_schemas(user_id=user_id, thread_id=thread_id)
         cols = schemas.get(target_table, [])
         q_words = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
         col_tokens = {t for c in cols for t in re.findall(r"[a-zA-Z0-9]+", c.lower()) if len(t) >= 3}
@@ -117,16 +124,23 @@ class TabularQueryEngine:
 
         return False
 
-    def detect_target_table(self, query: str) -> Optional[str]:
+    def detect_target_table(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
         """Identify which registered table best matches the query string.
 
         Args:
             query: Natural language query string.
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             Matching table name or None if no candidate matches.
         """
-        schemas = self.tabular_store.get_table_schemas()
+        schemas = self.tabular_store.get_table_schemas(user_id=user_id, thread_id=thread_id)
         if not schemas:
             return None
 
@@ -181,17 +195,25 @@ class TabularQueryEngine:
 
         return None
 
-    def generate_sql(self, query: str, target_table: Optional[str] = None) -> str:
+    def generate_sql(
+        self,
+        query: str,
+        target_table: Optional[str] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> str:
         """Synthesize a safe, schema-aware DuckDB SQL query matching user conditions.
 
         Args:
             query: User query string.
             target_table: Optional target table name.
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             DuckDB SQL query string with LIMIT 15 bound.
         """
-        table_name = target_table or self.detect_target_table(query)
+        table_name = target_table or self.detect_target_table(query, user_id=user_id, thread_id=thread_id)
         if not table_name:
             raise ValueError("No matching registered table found for tabular query.")
 
@@ -412,11 +434,18 @@ class TabularQueryEngine:
             clean_sql = f"{clean_sql}\nLIMIT {max_limit}"
         return f"{clean_sql};"
 
-    def execute_safe(self, sql: str) -> List[Dict[str, Any]]:
+    def execute_safe(
+        self,
+        sql: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Validate and execute read-only SQL query safely via TabularStore.
 
         Args:
             sql: SQL statement to execute.
+            user_id: Optional requesting tenant user_id.
+            thread_id: Optional requesting tenant thread_id.
 
         Returns:
             List of row dictionaries.
@@ -428,13 +457,15 @@ class TabularQueryEngine:
             raise ValueError(f"Unsafe SQL rejected: Mutating keywords detected in query: {sql}")
 
         safe_sql = self._enforce_limit(sql, max_limit=15)
-        return self.tabular_store.execute_query(safe_sql)
+        return self.tabular_store.execute_query(safe_sql, user_id=user_id, thread_id=thread_id)
 
     def serialize_rows_to_candidates(
         self,
         rows: List[Dict[str, Any]],
         table_name: str,
         doc_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[RetrievalCandidate]:
         """Serialize returned tabular rows into standard RetrievalCandidate objects.
 
@@ -442,11 +473,13 @@ class TabularQueryEngine:
             rows: List of column-value row dictionaries returned by DuckDB.
             table_name: Name of queried table.
             doc_id: Originating document identifier.
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             List of RetrievalCandidate models formatted for prompt and verification.
         """
-        effective_doc_id = doc_id or self.tabular_store.get_doc_for_table(table_name) or table_name
+        effective_doc_id = doc_id or self.tabular_store.get_doc_for_table(table_name, user_id=user_id, thread_id=thread_id) or table_name
         candidates: List[RetrievalCandidate] = []
 
         for idx, row in enumerate(rows, start=1):
@@ -486,29 +519,44 @@ class TabularQueryEngine:
                 text=text,
                 score=1.0,
                 match_type="tabular_sql",
+                user_id=user_id,
+                thread_id=thread_id,
             )
             candidates.append(candidate)
 
         return candidates
 
-    def query(self, query: str) -> List[RetrievalCandidate]:
-        """End-to-end execution of natural language relational query to RetrievalCandidates.
+    def query(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> List[RetrievalCandidate]:
+        """End-to-end execution of natural language relational query to RetrievalCandidates with tenant isolation.
 
         Args:
             query: User search query string.
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             List of RetrievalCandidate models representing matching table rows.
         """
-        table_name = self.detect_target_table(query)
+        table_name = self.detect_target_table(query, user_id=user_id, thread_id=thread_id)
         if not table_name:
             return []
 
-        sql = self.generate_sql(query, target_table=table_name)
+        sql = self.generate_sql(query, target_table=table_name, user_id=user_id, thread_id=thread_id)
         print(f"[TabularEngine] Executing generated DuckDB SQL on '{table_name}':\n{sql}")
 
-        rows = self.execute_safe(sql)
+        rows = self.execute_safe(sql, user_id=user_id, thread_id=thread_id)
         print(f"[TabularEngine] Query returned {len(rows)} row(s).")
 
-        doc_id = self.tabular_store.get_doc_for_table(table_name) or table_name
-        return self.serialize_rows_to_candidates(rows, table_name=table_name, doc_id=doc_id)
+        doc_id = self.tabular_store.get_doc_for_table(table_name, user_id=user_id, thread_id=thread_id) or table_name
+        return self.serialize_rows_to_candidates(
+            rows,
+            table_name=table_name,
+            doc_id=doc_id,
+            user_id=user_id,
+            thread_id=thread_id,
+        )

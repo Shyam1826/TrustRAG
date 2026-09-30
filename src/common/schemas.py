@@ -49,6 +49,8 @@ class ChildChunk(StrictBaseModel):
     section_name: str = "General"
     relative_path: Optional[str] = None
     folder_hierarchy: Optional[List[str]] = None
+    user_id: Optional[str] = None
+    thread_id: Optional[str] = None
 
 
 class ParentChunk(StrictBaseModel):
@@ -62,6 +64,8 @@ class ParentChunk(StrictBaseModel):
     section_name: str = "General"
     relative_path: Optional[str] = None
     folder_hierarchy: Optional[List[str]] = None
+    user_id: Optional[str] = None
+    thread_id: Optional[str] = None
 
 
 class RetrievalCandidate(StrictBaseModel):
@@ -76,6 +80,8 @@ class RetrievalCandidate(StrictBaseModel):
     section_name: str = "General"
     relative_path: Optional[str] = None
     folder_hierarchy: Optional[List[str]] = None
+    user_id: Optional[str] = None
+    thread_id: Optional[str] = None
 
 
 class GeneratedDraft(StrictBaseModel):

@@ -97,6 +97,8 @@ class CrossEncoderReranker:
         doc_filter: Optional[Union[str, List[str]]] = None,
         max_chunks_per_doc: Optional[int] = None,
         is_comparative: Optional[bool] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[RetrievalCandidate]:
         """Rerank candidate children, expand adjacent parent neighbors, and return top context passages.
 
@@ -183,6 +185,8 @@ class CrossEncoderReranker:
                         score=group_score,
                         match_type="cross_encoder_reranked",
                         chunk_index=single.chunk_index,
+                        user_id=getattr(single, "user_id", None),
+                        thread_id=getattr(single, "thread_id", None),
                     )
                 else:
                     combined_text = "\n\n".join(p.text for p in group_parents)
@@ -196,8 +200,15 @@ class CrossEncoderReranker:
                         score=group_score,
                         match_type="cross_encoder_neighbor_expanded",
                         chunk_index=first_p.chunk_index,
+                        user_id=getattr(first_p, "user_id", None),
+                        thread_id=getattr(first_p, "thread_id", None),
                     )
                 expanded_candidates.append(candidate)
+
+        if user_id is not None:
+            expanded_candidates = [c for c in expanded_candidates if getattr(c, "user_id", None) == user_id]
+        if thread_id is not None:
+            expanded_candidates = [c for c in expanded_candidates if getattr(c, "thread_id", None) == thread_id]
 
         # Sort all candidates descending by cross-encoder relevance score
         expanded_candidates.sort(key=lambda x: x.score, reverse=True)

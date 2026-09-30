@@ -198,8 +198,10 @@ class TrustRAGPipeline:
         relative_path: Optional[str] = None,
         folder_hierarchy: Optional[List[str]] = None,
         force_reindex: bool = False,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[ChildChunk]:
-        """Ingest, chunk, embed, and index a document (PDF, Excel .xlsx/.xls, CSV, TXT) with manifest caching.
+        """Ingest, chunk, embed, and index a document (PDF, Excel .xlsx/.xls, CSV, TXT) with manifest caching and tenant isolation.
 
         Args:
             file_path: File system path to the document.
@@ -207,6 +209,8 @@ class TrustRAGPipeline:
             relative_path: Optional full relative subfolder path.
             folder_hierarchy: Optional list of parent folder categories.
             force_reindex: If True, bypass manifest check and re-index.
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             List of indexed ChildChunk models.
@@ -233,21 +237,32 @@ class TrustRAGPipeline:
         ext = path.suffix.lower()
         if ext in (".csv", ".tsv", ".xlsx", ".xls"):
             try:
-                self.tabular_store.register_table_from_file(path, assigned_doc_id)
+                self.tabular_store.register_table_from_file(
+                    path,
+                    assigned_doc_id,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                )
             except Exception as e:
                 print(f"[TabularStore] Warning: Failed to register {path.name} in DuckDB: {e}")
 
-        # Step 0b: Check Incremental Manifest Fingerprint
-        if not force_reindex and self.manifest.is_indexed_and_current(path, assigned_doc_id):
+        # Step 0b: Check Incremental Manifest Fingerprint (only when no tenant is specified)
+        if user_id is None and not force_reindex and self.manifest.is_indexed_and_current(path, assigned_doc_id):
             print(f"[Ingestion] '{assigned_doc_id}' unchanged (already indexed) -> Skipping.")
             self.known_doc_ids.add(assigned_doc_id)
             return []
 
         # If document was previously indexed with different content, clear stale points
-        self.local_store.delete_document(assigned_doc_id)
-        # Clear local child chunks for this doc_id
-        self.all_child_chunks = [c for c in self.all_child_chunks if c.doc_id != assigned_doc_id]
-        self.child_chunk_map = {cid: c for cid, c in self.child_chunk_map.items() if c.doc_id != assigned_doc_id}
+        self.local_store.delete_document(assigned_doc_id, user_id=user_id, thread_id=thread_id)
+        # Clear local child chunks for this doc_id and tenant
+        self.all_child_chunks = [
+            c for c in self.all_child_chunks
+            if not (c.doc_id == assigned_doc_id and (user_id is None or getattr(c, "user_id", None) == user_id))
+        ]
+        self.child_chunk_map = {
+            cid: c for cid, c in self.child_chunk_map.items()
+            if not (c.doc_id == assigned_doc_id and (user_id is None or getattr(c, "user_id", None) == user_id))
+        }
 
         # Step 1: Extract pages/sheets via format-specific reader
         pages = read_document(path, doc_id=assigned_doc_id)
@@ -273,13 +288,17 @@ class TrustRAGPipeline:
         if not children:
             return []
 
-        # Attach folder hierarchy & relative paths to chunk metadata
+        # Attach folder hierarchy, relative paths & tenant coordinates to chunk metadata
         for p in parents:
             p.relative_path = doc_rel_path
             p.folder_hierarchy = doc_folders
+            p.user_id = user_id
+            p.thread_id = thread_id
         for c in children:
             c.relative_path = doc_rel_path
             c.folder_hierarchy = doc_folders
+            c.user_id = user_id
+            c.thread_id = thread_id
 
         # Step 3: Embed Dense and Sparse
         child_texts = [child.text for child in children]
@@ -294,19 +313,19 @@ class TrustRAGPipeline:
         self.known_doc_ids.add(assigned_doc_id)
 
         # Step 4: Index into Qdrant & Parent Cache
-        self.local_store.upsert_child_chunks(children)
-        self.local_store.store_parents(parents)
+        self.local_store.upsert(children, parents=parents)
 
         # Step 5: Update BM25 Inverted Index
         self.bm25_searcher = BM25Searcher(self.all_child_chunks)
 
         # Step 6: Record in Manifest
-        self.manifest.record_indexed(
-            path=path,
-            doc_id=assigned_doc_id,
-            chunk_count=len(children),
-            metadata={"relative_path": doc_rel_path, "folders": doc_folders},
-        )
+        if user_id is None:
+            self.manifest.record_indexed(
+                path=path,
+                doc_id=assigned_doc_id,
+                chunk_count=len(children),
+                metadata={"relative_path": doc_rel_path, "folders": doc_folders},
+            )
 
         print(f"Successfully indexed {len(children)} chunks from {path.name} (doc_id: '{assigned_doc_id}').")
         return children
@@ -318,6 +337,8 @@ class TrustRAGPipeline:
         relative_path: Optional[str] = None,
         folder_hierarchy: Optional[List[str]] = None,
         force_reindex: bool = False,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[ChildChunk]:
         """Backward-compatible alias for ingest_document."""
         return self.ingest_document(
@@ -326,6 +347,8 @@ class TrustRAGPipeline:
             relative_path=relative_path,
             folder_hierarchy=folder_hierarchy,
             force_reindex=force_reindex,
+            user_id=user_id,
+            thread_id=thread_id,
         )
 
     def ingest_directory(
@@ -333,13 +356,17 @@ class TrustRAGPipeline:
         raw_dir: str = "data/raw",
         supported_extensions: Optional[Set[str]] = None,
         force_reindex: bool = False,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[ChildChunk]:
-        """Recursively discover and ingest all supported document files across subfolders in raw_dir.
+        """Recursively discover and ingest all supported document files across subfolders in raw_dir with tenant scoping.
 
         Args:
             raw_dir: Path to base raw data directory.
             supported_extensions: Optional set of allowed file extensions.
             force_reindex: If True, bypass manifest and re-index all files.
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             List of all indexed ChildChunk models.
@@ -357,11 +384,16 @@ class TrustRAGPipeline:
                 # Ensure tabular file is registered in DuckDB in-memory store
                 if file_path.suffix.lower() in (".csv", ".tsv", ".xlsx", ".xls"):
                     try:
-                        self.tabular_store.register_table_from_file(file_path, doc_id)
+                        self.tabular_store.register_table_from_file(
+                            file_path,
+                            doc_id,
+                            user_id=user_id,
+                            thread_id=thread_id,
+                        )
                     except Exception as e:
                         print(f"[TabularStore] Warning: Failed to register {file_path.name} in DuckDB: {e}")
 
-                if not force_reindex and self.manifest.is_indexed_and_current(file_path, doc_id):
+                if user_id is None and not force_reindex and self.manifest.is_indexed_and_current(file_path, doc_id):
                     print(f"[Ingestion] '{doc_id}' unchanged (already indexed) -> Skipping.")
                     self.known_doc_ids.add(doc_id)
                     skipped_count += 1
@@ -372,13 +404,15 @@ class TrustRAGPipeline:
                         relative_path=rel_str,
                         folder_hierarchy=folders,
                         force_reindex=force_reindex,
+                        user_id=user_id,
+                        thread_id=thread_id,
                     )
                     all_indexed.extend(chunks)
                     indexed_count += 1
 
         # If any files were skipped or in-memory chunks are empty, hydrate from persistent vector store
         if skipped_count > 0 or len(self.all_child_chunks) == 0:
-            stored_chunks = self.local_store.load_all_child_chunks()
+            stored_chunks = self.local_store.load_all_child_chunks(user_id=user_id, thread_id=thread_id)
             if stored_chunks:
                 self.all_child_chunks = stored_chunks
                 self.child_chunk_map = {c.chunk_id: c for c in stored_chunks}
@@ -399,12 +433,14 @@ class TrustRAGPipeline:
         self,
         sub_q: str,
         top_k: int,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> Tuple[List[RetrievalCandidate], List[Tuple[str, int, float]], List[Tuple[str, int, float]]]:
         """Execute concurrent tabular check, dense search, and sparse search for an individual sub-query."""
         sub_tabular_cands: List[RetrievalCandidate] = []
-        if self.tabular_engine.is_tabular_query(sub_q):
+        if self.tabular_engine.is_tabular_query(sub_q, user_id=user_id, thread_id=thread_id):
             try:
-                sub_tabular_cands = self.tabular_engine.query(sub_q)
+                sub_tabular_cands = self.tabular_engine.query(sub_q, user_id=user_id, thread_id=thread_id)
             except Exception as e:
                 print(f"[TabularEngine] Sub-query execution error: {e}")
 
@@ -426,6 +462,8 @@ class TrustRAGPipeline:
                 self.local_store.client,
                 top_k=top_k,
                 doc_filter=sub_doc_filter,
+                user_id=user_id,
+                thread_id=thread_id,
             )
 
         if self.bm25_searcher and sub_tokens:
@@ -433,15 +471,24 @@ class TrustRAGPipeline:
                 sub_tokens,
                 top_k=top_k,
                 doc_filter=sub_doc_filter,
+                user_id=user_id,
+                thread_id=thread_id,
             )
 
         return sub_tabular_cands, dense_ranks, sparse_ranks
 
-    def _retrieve_narrative(self, user_query: str) -> List[RetrievalCandidate]:
+    def _retrieve_narrative(
+        self,
+        user_query: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> List[RetrievalCandidate]:
         """Execute hybrid dense-sparse retrieval, RRF fusion, and cross-encoder reranking on narrative chunks.
 
         Args:
             user_query: User search query.
+            user_id: Optional tenant user identifier for isolation.
+            thread_id: Optional session thread identifier for isolation.
 
         Returns:
             List of reranked RetrievalCandidate models.
@@ -465,6 +512,8 @@ class TrustRAGPipeline:
                 self.local_store.client,
                 top_k=top_k_dense,
                 doc_filter=doc_filter,
+                user_id=user_id,
+                thread_id=thread_id,
             )
 
         if self.bm25_searcher and query_tokens:
@@ -472,6 +521,8 @@ class TrustRAGPipeline:
                 query_tokens,
                 top_k=top_k_dense,
                 doc_filter=doc_filter,
+                user_id=user_id,
+                thread_id=thread_id,
             )
 
         fused_candidates = apply_rrf(
@@ -482,6 +533,8 @@ class TrustRAGPipeline:
             child_chunk_map=self.child_chunk_map,
             query=clean_query,
             doc_filter=doc_filter,
+            user_id=user_id,
+            thread_id=thread_id,
         )
         candidate_cids = [cid for cid, _ in fused_candidates]
 
@@ -492,13 +545,22 @@ class TrustRAGPipeline:
             local_store=self.local_store,
             top_k=config.retrieval.top_k_rerank,
             doc_filter=doc_filter,
+            user_id=user_id,
+            thread_id=thread_id,
         )
 
-    def retrieve(self, user_query: str) -> List[RetrievalCandidate]:
+    def retrieve(
+        self,
+        user_query: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> List[RetrievalCandidate]:
         """Retrieve relevant context candidates across relational tabular and narrative documents using concurrent execution.
 
         Args:
             user_query: Natural language query string.
+            user_id: Optional tenant user identifier for isolation.
+            thread_id: Optional session thread identifier for isolation.
 
         Returns:
             List of RetrievalCandidate models.
@@ -517,14 +579,14 @@ class TrustRAGPipeline:
             sub_results: List[List[RetrievalCandidate]] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 def _fetch_sub_intent(sq: str) -> List[RetrievalCandidate]:
-                    if self.tabular_engine.is_tabular_query(sq):
+                    if self.tabular_engine.is_tabular_query(sq, user_id=user_id, thread_id=thread_id):
                         try:
-                            tab = self.tabular_engine.query(sq)
+                            tab = self.tabular_engine.query(sq, user_id=user_id, thread_id=thread_id)
                             if tab:
                                 return tab
                         except Exception as ex:
                             print(f"[TabularEngine] Sub-query error: {ex}")
-                    return self._retrieve_narrative(sq)
+                    return self._retrieve_narrative(sq, user_id=user_id, thread_id=thread_id)
 
                 futures = {executor.submit(_fetch_sub_intent, sq): sq for sq in sub_queries}
                 for future in concurrent.futures.as_completed(futures):
@@ -570,10 +632,10 @@ class TrustRAGPipeline:
 
         # Branch B: Solitary Query Execution
         # Check tabular intent first (if pure relational tabular query, execute directly)
-        is_tabular = self.tabular_engine.is_tabular_query(user_query)
+        is_tabular = self.tabular_engine.is_tabular_query(user_query, user_id=user_id, thread_id=thread_id)
         if is_tabular and not is_comparative_query(user_query):
             try:
-                tab_candidates = self.tabular_engine.query(user_query)
+                tab_candidates = self.tabular_engine.query(user_query, user_id=user_id, thread_id=thread_id)
                 if tab_candidates:
                     return tab_candidates
             except Exception as e:
@@ -592,7 +654,7 @@ class TrustRAGPipeline:
 
         # Execute dense, sparse, and tabular checks concurrently
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            fut = executor.submit(self._execute_sub_query, user_query, top_k_dense)
+            fut = executor.submit(self._execute_sub_query, user_query, top_k_dense, user_id, thread_id)
             tab_cands, dense_r, sparse_r = fut.result()
             all_tabular_candidates.extend(tab_cands)
             all_dense_ranks.extend(dense_r)
@@ -618,6 +680,8 @@ class TrustRAGPipeline:
                 child_chunk_map=self.child_chunk_map,
                 query=clean_query,
                 doc_filter=doc_filter,
+                user_id=user_id,
+                thread_id=thread_id,
             )
             candidate_cids = [cid for cid, _ in fused_candidates]
 
@@ -629,6 +693,8 @@ class TrustRAGPipeline:
                 local_store=self.local_store,
                 top_k=top_k_rerank,
                 doc_filter=doc_filter,
+                user_id=user_id,
+                thread_id=thread_id,
             )
 
         # Merge candidates: tabular candidates + narrative candidates
@@ -640,11 +706,18 @@ class TrustRAGPipeline:
         else:
             return narrative_candidates
 
-    def ask(self, user_query: str) -> TrustAuditReport:
+    def ask(
+        self,
+        user_query: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> TrustAuditReport:
         """Process a user query with dynamic scope routing, neighbor expansion, and NLI verification.
 
         Args:
             user_query: Raw user search query.
+            user_id: Optional tenant user identifier for isolation.
+            thread_id: Optional session thread identifier for isolation.
 
         Returns:
             TrustAuditReport containing draft text, per-claim audits, and safety action.
@@ -659,7 +732,7 @@ class TrustRAGPipeline:
             )
 
         # 1. Execute Unified Retrieval (Tabular + Narrative Fusion with Sub-Query Decomp)
-        top_contexts = self.retrieve(user_query)
+        top_contexts = self.retrieve(user_query, user_id=user_id, thread_id=thread_id)
         self.last_retrieved_contexts = top_contexts
 
         if not top_contexts:

@@ -43,7 +43,7 @@ r"""
 
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import duckdb
 
 
@@ -62,6 +62,7 @@ class TabularStore:
         self._table_types: Dict[str, Dict[str, str]] = {}
         self._table_to_doc: Dict[str, str] = {}
         self._doc_to_tables: Dict[str, List[str]] = {}
+        self._table_to_tenant: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
     @staticmethod
     def sanitize_identifier(name: str) -> str:
@@ -86,12 +87,16 @@ class TabularStore:
         self,
         file_path: Union[str, Path],
         doc_id: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[str]:
-        """Ingest and register a structured CSV or Excel file as one or more DuckDB tables.
+        """Ingest and register a structured CSV or Excel file as one or more DuckDB tables with tenant scoping.
 
         Args:
             file_path: Filesystem path to CSV, TSV, or Excel file.
             doc_id: Document identifier.
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             List of registered table names in DuckDB.
@@ -101,7 +106,13 @@ class TabularStore:
             raise FileNotFoundError(f"Tabular file not found at: {file_path}")
 
         ext = path.suffix.lower()
-        base_table_name = self.sanitize_identifier(doc_id)
+        clean_doc_id = self.sanitize_identifier(doc_id)
+        if user_id or thread_id:
+            prefix = f"{self.sanitize_identifier(user_id or 'anon')}_{self.sanitize_identifier(thread_id or 'main')}_"
+            base_table_name = f"{prefix}{clean_doc_id}"
+        else:
+            base_table_name = clean_doc_id
+
         registered_tables: List[str] = []
 
         if ext in (".csv", ".tsv"):
@@ -112,7 +123,7 @@ class TabularStore:
                     f"CREATE OR REPLACE TABLE {base_table_name} AS "
                     f"SELECT * FROM read_csv_auto('{quoted_path}', header=True)"
                 )
-                self._record_table_metadata(base_table_name, doc_id)
+                self._record_table_metadata(base_table_name, doc_id, user_id=user_id, thread_id=thread_id)
                 registered_tables.append(base_table_name)
             except Exception as e:
                 # Fallback via pandas if native loader hits delimiter or encoding quirks
@@ -123,7 +134,7 @@ class TabularStore:
                 self.con.register(temp_name, df)
                 self.con.execute(f"CREATE OR REPLACE TABLE {base_table_name} AS SELECT * FROM {temp_name}")
                 self.con.unregister(temp_name)
-                self._record_table_metadata(base_table_name, doc_id)
+                self._record_table_metadata(base_table_name, doc_id, user_id=user_id, thread_id=thread_id)
                 registered_tables.append(base_table_name)
 
         elif ext in (".xlsx", ".xls"):
@@ -157,7 +168,7 @@ class TabularStore:
                 self.con.execute(f"CREATE OR REPLACE TABLE {sheet_table_name} AS SELECT * FROM {temp_name}")
                 self.con.unregister(temp_name)
 
-                self._record_table_metadata(sheet_table_name, doc_id)
+                self._record_table_metadata(sheet_table_name, doc_id, user_id=user_id, thread_id=thread_id)
                 registered_tables.append(sheet_table_name)
 
             # If only 1 non-empty sheet was registered, also alias base_table_name
@@ -165,7 +176,7 @@ class TabularStore:
                 self.con.execute(
                     f"CREATE OR REPLACE TABLE {base_table_name} AS SELECT * FROM {registered_tables[0]}"
                 )
-                self._record_table_metadata(base_table_name, doc_id)
+                self._record_table_metadata(base_table_name, doc_id, user_id=user_id, thread_id=thread_id)
                 registered_tables.append(base_table_name)
 
         if registered_tables:
@@ -176,21 +187,47 @@ class TabularStore:
 
         return registered_tables
 
-    def _record_table_metadata(self, table_name: str, doc_id: str) -> None:
-        """Inspect and cache table schema column names and data types."""
+    def _record_table_metadata(
+        self,
+        table_name: str,
+        doc_id: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        """Inspect and cache table schema column names, data types, and tenant mapping."""
         cols_info = self.con.execute(f"DESCRIBE {table_name}").fetchall()
         col_names = [r[0] for r in cols_info]
         col_types = {r[0]: str(r[1]).upper() for r in cols_info}
         self._table_schemas[table_name] = col_names
         self._table_types[table_name] = col_types
+        self._table_to_tenant[table_name] = (user_id, thread_id)
 
-    def get_table_schemas(self) -> Dict[str, List[str]]:
-        """Return registered table names and their column headers.
+    def get_table_schemas(
+        self,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> Dict[str, List[str]]:
+        """Return registered table names and their column headers filtered by tenant.
+
+        Args:
+            user_id: Optional tenant user_id.
+            thread_id: Optional tenant thread_id.
 
         Returns:
             Dictionary mapping table name to list of column names.
         """
-        return dict(self._table_schemas)
+        if user_id is not None:
+            return {
+                t: cols for t, cols in self._table_schemas.items()
+                if self._table_to_tenant.get(t, (None, None))[0] == user_id
+                and (thread_id is None or self._table_to_tenant.get(t, (None, None))[1] == thread_id)
+            }
+        else:
+            unscoped = {
+                t: cols for t, cols in self._table_schemas.items()
+                if self._table_to_tenant.get(t, (None, None))[0] is None
+            }
+            return unscoped if unscoped or not self._table_schemas else dict(self._table_schemas)
 
     def get_table_columns_with_types(self, table_name: str) -> Dict[str, str]:
         """Return column names and SQL types for a specific table.
@@ -203,27 +240,70 @@ class TabularStore:
         """
         return dict(self._table_types.get(table_name, {}))
 
-    def get_table_names(self) -> List[str]:
-        """Return all registered table names."""
-        return list(self._table_schemas.keys())
+    def get_table_names(
+        self,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> List[str]:
+        """Return registered table names scoped by tenant."""
+        return list(self.get_table_schemas(user_id=user_id, thread_id=thread_id).keys())
 
-    def get_doc_for_table(self, table_name: str) -> Optional[str]:
-        """Return originating doc_id for a given table name."""
+    def get_doc_for_table(
+        self,
+        table_name: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return originating doc_id for a given table name verifying tenant ownership."""
+        if user_id is not None:
+            tenant = self._table_to_tenant.get(table_name, (None, None))
+            if tenant[0] != user_id or (thread_id is not None and tenant[1] != thread_id):
+                return None
         return self._table_to_doc.get(table_name)
 
-    def get_tables_for_doc(self, doc_id: str) -> List[str]:
-        """Return table names registered for a given doc_id."""
-        return self._doc_to_tables.get(doc_id, [])
+    def get_tables_for_doc(
+        self,
+        doc_id: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> List[str]:
+        """Return table names registered for a given doc_id verifying tenant ownership."""
+        tables = self._doc_to_tables.get(doc_id, [])
+        if user_id is not None:
+            return [
+                t for t in tables
+                if self._table_to_tenant.get(t, (None, None))[0] == user_id
+                and (thread_id is None or self._table_to_tenant.get(t, (None, None))[1] == thread_id)
+            ]
+        return tables
 
-    def execute_query(self, sql: str) -> List[Dict[str, Any]]:
-        """Execute a read-only SQL query safely via cursor.
+    def execute_query(
+        self,
+        sql: str,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Execute a read-only SQL query safely via cursor with cross-tenant access enforcement.
 
         Args:
             sql: SQL statement to execute.
+            user_id: Optional requesting tenant user_id.
+            thread_id: Optional requesting tenant thread_id.
 
         Returns:
             List of row dictionaries with column-value mappings.
+
+        Raises:
+            PermissionError: If SQL references a table registered to another tenant.
         """
+        if user_id is not None:
+            for t, (t_user, t_thr) in self._table_to_tenant.items():
+                if t_user is not None and t_user != user_id:
+                    if re.search(r"\b" + re.escape(t) + r"\b", sql, re.IGNORECASE):
+                        raise PermissionError(
+                            f"Cross-tenant access violation: table '{t}' does not belong to user '{user_id}'."
+                        )
+
         cursor = self.con.cursor()
         try:
             df = cursor.execute(sql).df()

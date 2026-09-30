@@ -58,6 +58,8 @@ class DenseSearcher:
         query_text: str,
         top_k: int = 20,
         doc_filter: Optional[Union[str, List[str]]] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[Tuple[str, int, float]]:
         """Retrieve top-k child chunks via dense cosine similarity search in Qdrant.
 
@@ -65,6 +67,8 @@ class DenseSearcher:
             query_text: Normalized search query.
             top_k: Maximum number of nearest neighbors to retrieve.
             doc_filter: Optional document ID or list of document IDs.
+            user_id: Optional tenant user_id filter.
+            thread_id: Optional tenant thread_id filter.
 
         Returns:
             A 1-indexed ranked list of tuples: [(child_id, rank, score), ...].
@@ -81,7 +85,7 @@ class DenseSearcher:
         if isinstance(doc_filter, list) and len(doc_filter) > 0:
             clean_filters = [d.strip() for d in doc_filter if isinstance(d, str) and d.strip()]
             if len(clean_filters) == 1:
-                return self._search_single(query_vector, top_k, clean_filters[0])
+                return self._search_single(query_vector, top_k, clean_filters[0], user_id=user_id, thread_id=thread_id)
             elif len(clean_filters) > 1:
                 configured_cap = getattr(config.retrieval, "max_chunks_per_doc", 3)
                 dynamic_quota = max(1, top_k // min(len(clean_filters), 3))
@@ -97,6 +101,8 @@ class DenseSearcher:
                         query_vector=query_vector,
                         limit=k_per_doc,
                         doc_filter=target_doc,
+                        user_id=user_id,
+                        thread_id=thread_id,
                     )
                     for pt in res:
                         cid = pt.get("child_id", "")
@@ -115,19 +121,29 @@ class DenseSearcher:
                 return [(cid, rank, score) for rank, (cid, score) in enumerate(all_points[:top_k], start=1)]
 
         # Single document or global search
-        return self._search_single(query_vector, top_k, doc_filter if isinstance(doc_filter, str) else None)
+        return self._search_single(
+            query_vector,
+            top_k,
+            doc_filter if isinstance(doc_filter, str) else None,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
 
     def _search_single(
         self,
         query_vector: List[float],
         top_k: int,
         doc_filter: Optional[str],
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[Tuple[str, int, float]]:
-        """Execute single-filter or global search."""
+        """Execute single-filter or global search with tenant isolation."""
         res = self.vector_store.search(
             query_vector=query_vector,
             limit=top_k,
             doc_filter=doc_filter,
+            user_id=user_id,
+            thread_id=thread_id,
         )
         ranked_results: List[Tuple[str, int, float]] = []
         for rank_idx, pt in enumerate(res, start=1):
@@ -145,6 +161,8 @@ def retrieve_dense(
     collection_name: str = "trustrag_enterprise",
     top_k: int = 20,
     doc_filter: Optional[Union[str, List[str]]] = None,
+    user_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> List[Tuple[str, int, float]]:
     """Functional wrapper for dense retrieval supporting both QdrantVectorStore and raw QdrantClient.
 
@@ -155,13 +173,21 @@ def retrieve_dense(
         collection_name: Target collection name.
         top_k: Maximum number of nearest neighbors to retrieve.
         doc_filter: Optional document ID or list of document IDs.
+        user_id: Optional tenant user_id filter.
+        thread_id: Optional tenant thread_id filter.
 
     Returns:
         A 1-indexed ranked list of tuples: [(child_id, rank, score), ...].
     """
     if hasattr(client_or_store, "search") and callable(client_or_store.search) and not hasattr(client_or_store, "get_collections"):
         searcher = DenseSearcher(vector_store=client_or_store, embedder=embedder)
-        return searcher.search(query_text=query_text, top_k=top_k, doc_filter=doc_filter)
+        return searcher.search(
+            query_text=query_text,
+            top_k=top_k,
+            doc_filter=doc_filter,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
 
     # Fallback to direct client execution if raw QdrantClient is passed
     if not query_text or not query_text.strip():

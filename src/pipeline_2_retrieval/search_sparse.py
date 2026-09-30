@@ -88,13 +88,17 @@ class BM25Searcher:
         query_tokens: List[str],
         top_k: int = 20,
         doc_filter: Optional[Union[str, List[str]]] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[Tuple[str, int, float]]:
-        """Score indexed child chunks against query tokens using BM25.
+        """Score indexed child chunks against query tokens using BM25 with tenant isolation.
 
         Args:
             query_tokens: List of lowercased keyword tokens.
             top_k: Maximum number of results to return.
             doc_filter: Optional document ID or list of document IDs to pre-filter candidate pool.
+            user_id: Optional tenant user_id filter.
+            thread_id: Optional tenant thread_id filter.
 
         Returns:
             A 1-indexed ranked list of tuples: [(child_id, rank, score), ...].
@@ -121,6 +125,8 @@ class BM25Searcher:
                         (chunk.chunk_id, float(score))
                         for chunk, score in zip(self.chunks, scores)
                         if chunk.doc_id == target_doc
+                        and (user_id is None or getattr(chunk, "user_id", None) == user_id)
+                        and (thread_id is None or getattr(chunk, "thread_id", None) == thread_id)
                     ]
                     doc_pairs.sort(key=lambda x: x[1], reverse=True)
                     balanced_pairs.extend(doc_pairs[:k_per_doc])
@@ -131,9 +137,13 @@ class BM25Searcher:
                     for rank_idx, (chunk_id, score) in enumerate(balanced_pairs[:top_k], start=1)
                 ]
 
-        # Pair chunks with BM25 scores and apply single doc_filter if active
+        # Pair chunks with BM25 scores and apply single doc_filter and tenant filters
         scored_pairs: List[Tuple[str, float]] = []
         for chunk, score in zip(self.chunks, scores):
+            if user_id is not None and getattr(chunk, "user_id", None) != user_id:
+                continue
+            if thread_id is not None and getattr(chunk, "thread_id", None) != thread_id:
+                continue
             if isinstance(doc_filter, str) and doc_filter and chunk.doc_id != doc_filter:
                 continue
             scored_pairs.append((chunk.chunk_id, float(score)))
