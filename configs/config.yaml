@@ -42,3 +42,7 @@ generation:
   groq_model: "qwen/qwen3.8-27b"
   gemini_model: "gemini-1.5-flash"
   max_context_chars: 4000      # <-- Hard context ceiling (<2,500 tokens)
+
+database:
+  url: "sqlite:///data/trustrag.db"
+  echo: false

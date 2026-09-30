@@ -105,6 +105,15 @@ class GeneratorConfig(BaseModel):
     gemini_model: str = Field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
 
 
+class DatabaseConfig(BaseModel):
+    """Relational database connection, session, and JWT security settings."""
+    url: str = Field(default_factory=lambda: os.getenv("DATABASE_URL", "sqlite:///data/trustrag.db"))
+    echo: bool = Field(default_factory=lambda: os.getenv("DATABASE_ECHO", "false").lower() == "true")
+    jwt_secret: str = Field(default_factory=lambda: os.getenv("JWT_SECRET", "trustrag_super_secret_jwt_key_2026"))
+    jwt_algorithm: str = Field(default_factory=lambda: os.getenv("JWT_ALGORITHM", "HS256"))
+    access_token_expire_minutes: int = Field(default_factory=lambda: int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440")))
+
+
 class ThresholdConfig(BaseModel):
     """Backward-compatible threshold container."""
     rrf_k: int = 60
@@ -123,6 +132,7 @@ class TrustRAGConfig(BaseSettings):
     models: ModelConfig = Field(default_factory=ModelConfig)
     generation: GeneratorConfig = Field(default_factory=GeneratorConfig)
     thresholds: ThresholdConfig = Field(default_factory=ThresholdConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
 
     # Top-level property aliases for direct access & 100% backward compatibility
     @property
@@ -181,6 +191,7 @@ def get_settings(yaml_path: str = "configs/config.yaml") -> TrustRAGConfig:
     verification_cfg = VerificationConfig(**yaml_data.get("verification", {}))
     models_cfg = ModelConfig(**yaml_data.get("models", {}))
     generation_cfg = GeneratorConfig(**yaml_data.get("generation", {}))
+    database_cfg = DatabaseConfig(**yaml_data.get("database", {}))
 
     # Keep thresholds synchronized with retrieval and verification configs
     thresholds_cfg = ThresholdConfig(
@@ -199,6 +210,7 @@ def get_settings(yaml_path: str = "configs/config.yaml") -> TrustRAGConfig:
         models=models_cfg,
         generation=generation_cfg,
         thresholds=thresholds_cfg,
+        database=database_cfg,
     )
 
 
