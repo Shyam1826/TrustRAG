@@ -259,6 +259,38 @@ class MockGenerator(BaseGenerator):
         if "192.168.1.1" in prompt and "gateway" in prompt:
             return "The gateway router IP is 192.168.1.1 with subnet 255.255.255.0 [Doc-3]."
 
+        # Grounded tabular relational row detection
+        if "[Section: Table:" in prompt:
+            docs = re.findall(
+                r'<document id="(?P<doc_id>Doc-\d+)"[^>]*>\s*(?P<doc_text>.*?)\s*</document>',
+                prompt,
+                re.DOTALL,
+            )
+            lines = []
+            for doc_handle, doc_text in docs:
+                clean_text = doc_text.strip()
+                if "[Section: Table:" in clean_text:
+                    body = re.sub(r"^\[Section:[^\]]+\]\s*", "", clean_text)
+                    items = [item.strip() for item in body.split(" | ") if ":" in item]
+                    kv = {}
+                    for item in items:
+                        parts = item.split(":", 1)
+                        if len(parts) == 2:
+                            kv[parts[0].strip()] = parts[1].strip()
+
+                    name = kv.get("Document Name") or kv.get("Filename") or kv.get("Name") or kv.get("Title") or "the contract"
+                    summary_parts = []
+                    for k, v in kv.items():
+                        if k not in ("Document Name", "Filename", "Name", "Title") and not k.endswith("-Answer"):
+                            val = v[:150].rstrip(".")
+                            summary_parts.append(f"{k} is '{val}'")
+
+                    attr_str = " and ".join(summary_parts) if summary_parts else "details are recorded"
+                    lines.append(f"- Under the {name}, {attr_str} [{doc_handle}].")
+
+            if lines:
+                return "\n".join(lines[:5])
+
         # Fallback for insufficient context
         return FALLBACK_INSUFFICIENT_INFO
 

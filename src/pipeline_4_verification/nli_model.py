@@ -92,7 +92,7 @@ class DebertaNLIVerifier:
         self,
         claims: List[str],
         premises: List[str],
-        batch_size: int = 16,
+        batch_size: int = 32,
     ) -> List[Dict[str, Dict[str, float]]]:
         """Compute NLI class probabilities for aligned (claim, premise) pairs.
 

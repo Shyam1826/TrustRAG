@@ -17,3 +17,6 @@ qdrant-client==1.10.1
 
 # Testing & Utilities
 pytest==8.2.2
+
+# Tabular Database Engine
+duckdb==1.5.6

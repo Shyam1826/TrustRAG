@@ -46,11 +46,12 @@
 
 from typing import List, Union
 from src.common.schemas import RetrievalCandidate
+from src.pipeline_3_generation.compactor import ContextCompactor
 
 FALLBACK_INSUFFICIENT_INFO = (
     "The provided documentation does not contain sufficient information to answer."
 )
-DEFAULT_MAX_CONTEXT_CHARS = 12000
+DEFAULT_MAX_CONTEXT_CHARS = 4000
 
 
 def build_rag_prompt(
@@ -68,10 +69,13 @@ def build_rag_prompt(
     Returns:
         Structured prompt string.
     """
+    compactor = ContextCompactor()
+    compacted_candidates = compactor.compact_contexts(query, contexts, max_total_chars=max_context_chars)
+
     context_blocks: List[str] = []
     current_char_count = 0
 
-    for idx, candidate in enumerate(contexts, start=1):
+    for idx, candidate in enumerate(compacted_candidates, start=1):
         clean_text = candidate.text.strip()
         doc_xml = (
             f'  <document id="Doc-{idx}" doc_id="{candidate.doc_id}" page="{candidate.page_number}">\n'
@@ -85,6 +89,7 @@ def build_rag_prompt(
         current_char_count += len(doc_xml)
 
     joined_context = "\n".join(context_blocks)
+    
 
     prompt = (
         "You are an enterprise AI assistant adhering to strict verification, taxonomy, and truthfulness standards.\n\n"
@@ -154,9 +159,11 @@ def build_correction_prompt(
         Structured self-correction prompt string.
     """
     if isinstance(context, list):
+        compactor = ContextCompactor()
+        compacted_candidates = compactor.compact_contexts(query, context, max_total_chars=max_context_chars)
         context_blocks = []
         current_char_count = 0
-        for idx, candidate in enumerate(context, start=1):
+        for idx, candidate in enumerate(compacted_candidates, start=1):
             clean_text = candidate.text.strip()
             doc_xml = (
                 f'  <document id="Doc-{idx}" doc_id="{candidate.doc_id}" page="{candidate.page_number}">\n'

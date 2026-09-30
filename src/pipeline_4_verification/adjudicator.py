@@ -414,6 +414,7 @@ class AuditAdjudicator:
         context_map: Dict[str, Any],
         nli_verifier: Any,
         draft_text: str = "",
+        batch_size: int = 32,
     ) -> TrustAuditReport:
         """Audit atomic claims against cited contexts and produce a TrustAuditReport.
 
@@ -527,7 +528,17 @@ class AuditAdjudicator:
 
         # 2. Run batch NLI inference for non-meta claims
         if batch_hypotheses:
-            predictions = nli_verifier.predict_batch(claims=batch_hypotheses, premises=batch_premises)
+            try:
+                predictions = nli_verifier.predict_batch(
+                    claims=batch_hypotheses,
+                    premises=batch_premises,
+                    batch_size=batch_size,
+                )
+            except TypeError:
+                predictions = nli_verifier.predict_batch(
+                    claims=batch_hypotheses,
+                    premises=batch_premises,
+                )
 
             # Group predictions by claim_index
             claim_results: Dict[int, List[Dict[str, Any]]] = defaultdict(list)

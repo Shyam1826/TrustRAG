@@ -75,8 +75,47 @@ class ScopeRouter:
         re.compile(r"\b(?:compare\s+the\s+candidates|compare\s+all|across\s+the\s+candidates)\b", re.IGNORECASE),
     ]
 
+    _RELATIONAL_MARKERS = [
+        re.compile(r"\b(?:where|whose|having|with\s+both|having\s+both)\b", re.IGNORECASE),
+        re.compile(r"\b(?:is|equals|=|equal\s+to|is\s+not|!=)\s+['\"]?(?:yes|no|true|false|[a-zA-Z0-9_.-]+)['\"]?", re.IGNORECASE),
+        re.compile(r"\b(?:filter(?:ed)?\s+by|rows?\s+where|clauses?\s+where|records?\s+where)\b", re.IGNORECASE),
+        re.compile(r"\b(?:count|sum|average|avg|minimum|min|maximum|max|total)\s+(?:of|for|across)?\b", re.IGNORECASE),
+        re.compile(r"\b(?:greater\s+than|less\s+than|above|below|at\s+least|at\s+most|[><]=?)\s+[0-9.]+", re.IGNORECASE),
+    ]
+
     def __init__(self) -> None:
         pass
+
+    def is_tabular_query(
+        self,
+        query: str,
+        available_tables: Optional[List[str]] = None,
+    ) -> bool:
+        """Detect whether a query targets structured tabular documents or relational operations.
+
+        Args:
+            query: User search query string.
+            available_tables: Optional list of known registered table names.
+
+        Returns:
+            True if query references known tabular tables or exhibits relational query markers.
+        """
+        if not query or not query.strip():
+            return False
+
+        has_relational = any(pat.search(query) for pat in self._RELATIONAL_MARKERS)
+        if not available_tables:
+            return has_relational
+
+        # Canonical substring match against known tables
+        query_lower = query.lower()
+        canonical_q = re.sub(r"[^a-z0-9]", "", query_lower)
+        for t in available_tables:
+            t_clean = re.sub(r"[^a-z0-9]", "", t.lower())
+            if len(t_clean) >= 3 and t_clean in canonical_q:
+                return True
+
+        return has_relational
 
     def _get_stop_words(self) -> Set[str]:
         """Combine standard English stop words with structural and configured custom stop words."""
@@ -280,3 +319,12 @@ def extract_document_scope(
     """Functional helper for scope routing."""
     router = ScopeRouter()
     return router.extract_doc_filter(query, available_doc_ids, doc_entity_map=doc_entity_map)
+
+
+def is_tabular_query(
+    query: str,
+    available_tables: Optional[List[str]] = None,
+) -> bool:
+    """Functional helper for detecting tabular relational queries."""
+    router = ScopeRouter()
+    return router.is_tabular_query(query, available_tables=available_tables)

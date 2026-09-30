@@ -41,4 +41,4 @@ generation:
   provider: "groq"
   groq_model: "qwen/qwen3.8-27b"
   gemini_model: "gemini-1.5-flash"
-  max_context_chars: 12000     # <-- Added: Hard context ceiling (~3,000 tokens)
+  max_context_chars: 4000      # <-- Hard context ceiling (<2,500 tokens)
