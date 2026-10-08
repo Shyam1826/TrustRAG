@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 import unicodedata
 
-from src.pipeline_1_ingestion.parser import extract_pdf_pages
+from src.pipeline_1_ingestion.parser import extract_image_document, extract_pdf_pages
 
 
 def read_excel(file_path: Union[str, Path], doc_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -141,12 +141,21 @@ def read_excel(file_path: Union[str, Path], doc_id: Optional[str] = None) -> Lis
     return sheet_pages
 
 
-def read_document(file_path: Union[str, Path], doc_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def read_document(
+    file_path: Union[str, Path],
+    doc_id: Optional[str] = None,
+    tabular_store: Optional[Any] = None,
+    user_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Universal document reader routing files to appropriate format serializers.
 
     Args:
         file_path: Path to target document file.
         doc_id: Optional unique identifier for the document.
+        tabular_store: Optional TabularStore instance for registering PDF tables.
+        user_id: Optional tenant user_id.
+        thread_id: Optional tenant thread_id.
 
     Returns:
         List of dictionaries with 'page_number' and 'raw_text'.
@@ -160,7 +169,15 @@ def read_document(file_path: Union[str, Path], doc_id: Optional[str] = None) -> 
     if ext in (".xlsx", ".xls"):
         return read_excel(path, doc_id=doc_id)
     elif ext == ".pdf":
-        return extract_pdf_pages(str(path))
+        return extract_pdf_pages(
+            str(path),
+            doc_id=doc_id,
+            tabular_store=tabular_store,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
+    elif ext in (".jpg", ".jpeg", ".png"):
+        return extract_image_document(path, doc_id=doc_id)
     elif ext in (".csv", ".tsv"):
         delimiter = "\t" if ext == ".tsv" else ","
         try:

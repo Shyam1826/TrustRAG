@@ -55,7 +55,7 @@ from typing import Any, Dict, List, Optional, Union
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
-from src.common.schemas import ChildChunk, ParentChunk
+from src.common.schemas import ChildChunk, ParentChunk, ProvenanceCoordinate
 
 
 class QdrantVectorStore:
@@ -188,6 +188,12 @@ class QdrantVectorStore:
                 "folder_hierarchy": folder_hierarchy,
                 "user_id": user_id,
                 "thread_id": thread_id,
+                "bbox": getattr(chunk, "bbox", None) or (getattr(parent, "bbox", None) if parent else None),
+                "provenance": (
+                    chunk.provenance.model_dump()
+                    if getattr(chunk, "provenance", None)
+                    else (parent.provenance.model_dump() if parent and getattr(parent, "provenance", None) else None)
+                ),
             }
 
             points.append(
@@ -300,16 +306,19 @@ class QdrantVectorStore:
         must_conditions: List[models.Condition] = []
         if user_id is not None:
             must_conditions.append(
-                models.FieldCondition(
-                    key="user_id",
-                    match=models.MatchValue(value=user_id),
-                )
-            )
-        if thread_id is not None:
-            must_conditions.append(
-                models.FieldCondition(
-                    key="thread_id",
-                    match=models.MatchValue(value=thread_id),
+                models.Filter(
+                    should=[
+                        models.FieldCondition(
+                            key="user_id",
+                            match=models.MatchValue(value=user_id),
+                        ),
+                        models.IsEmptyCondition(
+                            is_empty=models.PayloadField(key="user_id"),
+                        ),
+                        models.IsNullCondition(
+                            is_null=models.PayloadField(key="user_id"),
+                        ),
+                    ]
                 )
             )
         if must_conditions:
@@ -339,6 +348,9 @@ class QdrantVectorStore:
                 sparse_tokens = payload.get("sparse_tokens")
                 pt_user_id = payload.get("user_id")
                 pt_thread_id = payload.get("thread_id")
+                bbox_val = payload.get("bbox")
+                prov_val = payload.get("provenance")
+                prov_obj = ProvenanceCoordinate.model_validate(prov_val) if prov_val else None
 
                 chunk = ChildChunk(
                     chunk_id=chunk_id,
@@ -354,6 +366,8 @@ class QdrantVectorStore:
                     folder_hierarchy=folder_hierarchy,
                     user_id=pt_user_id,
                     thread_id=pt_thread_id,
+                    bbox=bbox_val,
+                    provenance=prov_obj,
                 )
                 all_chunks.append(chunk)
 
@@ -373,6 +387,8 @@ class QdrantVectorStore:
                             folder_hierarchy=folder_hierarchy,
                             user_id=pt_user_id,
                             thread_id=pt_thread_id,
+                            bbox=bbox_val,
+                            provenance=prov_obj,
                         )
                     else:
                         if chunk_id not in self._parent_store[parent_id].child_ids:
@@ -411,18 +427,23 @@ class QdrantVectorStore:
 
         if user_id is not None:
             must_conditions.append(
-                models.FieldCondition(
-                    key="user_id",
-                    match=models.MatchValue(value=user_id),
+                models.Filter(
+                    should=[
+                        models.FieldCondition(
+                            key="user_id",
+                            match=models.MatchValue(value=user_id),
+                        ),
+                        models.IsEmptyCondition(
+                            is_empty=models.PayloadField(key="user_id"),
+                        ),
+                        models.IsNullCondition(
+                            is_null=models.PayloadField(key="user_id"),
+                        ),
+                    ]
                 )
             )
-        if thread_id is not None:
-            must_conditions.append(
-                models.FieldCondition(
-                    key="thread_id",
-                    match=models.MatchValue(value=thread_id),
-                )
-            )
+        # Note: Do not restrict document chunk retrieval to a specific thread_id,
+        # so indexed documents in the vault belong to the user across all chat threads.
 
         if isinstance(doc_filter, str) and doc_filter.strip():
             must_conditions.append(

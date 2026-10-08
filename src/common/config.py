@@ -58,9 +58,9 @@ except ImportError:
 class IngestionConfig(BaseModel):
     """File ingestion and incremental manifest settings."""
     supported_extensions: List[str] = Field(
-        default_factory=lambda: [".pdf", ".docx", ".xlsx", ".xls", ".csv", ".txt", ".jpg", ".png"]
+        default_factory=lambda: [".pdf", ".docx", ".xlsx", ".xls", ".csv", ".txt", ".jpg", ".jpeg", ".png"]
     )
-    manifest_path: str = "data/ingestion_manifest.json"
+    manifest_path: str = "data/processed/ingestion_manifest.json"
 
 
 class ChunkingConfig(BaseModel):

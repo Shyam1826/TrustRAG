@@ -49,7 +49,7 @@ import difflib
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from src.common.schemas import RetrievalCandidate
+from src.common.schemas import ProvenanceCoordinate, RetrievalCandidate
 from src.pipeline_1_ingestion.tabular_store import TabularStore
 
 
@@ -480,6 +480,8 @@ class TabularQueryEngine:
             List of RetrievalCandidate models formatted for prompt and verification.
         """
         effective_doc_id = doc_id or self.tabular_store.get_doc_for_table(table_name, user_id=user_id, thread_id=thread_id) or table_name
+        source_type = self.tabular_store.get_source_type_for_table(table_name)
+        sheet_name = self.tabular_store.get_sheet_name_for_table(table_name)
         candidates: List[RetrievalCandidate] = []
 
         for idx, row in enumerate(rows, start=1):
@@ -510,6 +512,18 @@ class TabularQueryEngine:
             row_line = " | ".join(row_items)
             text = f"[Section: Table: {table_name} | Row: {idx}] {row_line}"
 
+            prov = ProvenanceCoordinate(
+                doc_id=effective_doc_id,
+                source_type=source_type,
+                page=1,
+                section_name=f"Table: {table_name} | Row: {idx}",
+                bbox=None,
+                sheet_name=sheet_name,
+                row_index=idx,
+                matched_columns=list(row.keys()),
+                snippet=row_line,
+            )
+
             candidate = RetrievalCandidate(
                 parent_id=f"{effective_doc_id}_row_{idx}",
                 doc_id=effective_doc_id,
@@ -521,6 +535,7 @@ class TabularQueryEngine:
                 match_type="tabular_sql",
                 user_id=user_id,
                 thread_id=thread_id,
+                provenance=prov,
             )
             candidates.append(candidate)
 

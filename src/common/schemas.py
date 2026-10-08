@@ -5,7 +5,7 @@ r"""
    - Role: Type system and data contracts layer for TrustRAG.
    - Purpose: Defines strict Pydantic v2 data models for inter-pipeline contracts,
      including hierarchical chunks with section breadcrumbs, retrieval candidates,
-     generated drafts, atomic claims, and trust audit reports.
+     generated drafts, atomic claims, dual-mode GroundingMode states, and trust audit reports.
 
 2. INPUT (IP):
    - Raw data structures, model outputs, and pipeline state dictionaries.
@@ -13,8 +13,10 @@ r"""
 3. PROCESS UNDER THE HOOD:
    - Enforces Pydantic v2 `extra="forbid"` and `validate_assignment=True`.
    - Models data flow from ingestion (ChildChunk, ParentChunk) to retrieval
-     (RetrievalCandidate), generation (GeneratedDraft), and verification (AtomicClaim,
-     ClaimAudit, TrustAuditReport).
+     (RetrievalCandidate), generation (GeneratedDraft), verification (AtomicClaim,
+     ClaimAudit, TrustAuditReport), and Knowledge Gap dual-mode fallback routing.
+   - Defines GroundingMode ("CLOSED_WORLD", "OPEN_WORLD_FALLBACK") to distinguish
+     vault-grounded reports from open-world parametric fallback responses.
    - Tracks `chunk_index` and `section_name` for structural scope and neighbor expansion.
 
 4. OUTPUT (OP):
@@ -22,18 +24,39 @@ r"""
    - Consumed by all modules across Pipelines 1 to 4.
 
 5. LIBRARIES & DEPENDENCIES:
+   - enum: Standard library Enum enumeration.
    - pydantic: Schema validation and JSON serialization.
    - typing: Standard library typing constructs.
 ================================================================================
 """
 
+from enum import Enum
 from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class GroundingMode(str, Enum):
+    """Execution mode determining evidence grounding constraints and verification rules."""
+    CLOSED_WORLD = "CLOSED_WORLD"
+    OPEN_WORLD_FALLBACK = "OPEN_WORLD_FALLBACK"
 
 
 class StrictBaseModel(BaseModel):
     """Base schema with strict extra field validation."""
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+class ProvenanceCoordinate(StrictBaseModel):
+    """Detailed document provenance lineage and physical bounding coordinates."""
+    doc_id: str
+    source_type: str  # 'pdf' | 'tabular_csv' | 'tabular_excel' | 'text'
+    page: Optional[int] = None
+    section_name: Optional[str] = None
+    bbox: Optional[List[float]] = None  # [x0, top, x1, bottom]
+    sheet_name: Optional[str] = None
+    row_index: Optional[int] = None
+    matched_columns: Optional[List[str]] = None
+    snippet: Optional[str] = None
 
 
 class ChildChunk(StrictBaseModel):
@@ -51,6 +74,8 @@ class ChildChunk(StrictBaseModel):
     folder_hierarchy: Optional[List[str]] = None
     user_id: Optional[str] = None
     thread_id: Optional[str] = None
+    bbox: Optional[List[float]] = None
+    provenance: Optional[ProvenanceCoordinate] = None
 
 
 class ParentChunk(StrictBaseModel):
@@ -66,6 +91,8 @@ class ParentChunk(StrictBaseModel):
     folder_hierarchy: Optional[List[str]] = None
     user_id: Optional[str] = None
     thread_id: Optional[str] = None
+    bbox: Optional[List[float]] = None
+    provenance: Optional[ProvenanceCoordinate] = None
 
 
 class RetrievalCandidate(StrictBaseModel):
@@ -82,6 +109,8 @@ class RetrievalCandidate(StrictBaseModel):
     folder_hierarchy: Optional[List[str]] = None
     user_id: Optional[str] = None
     thread_id: Optional[str] = None
+    bbox: Optional[List[float]] = None
+    provenance: Optional[ProvenanceCoordinate] = None
 
 
 class GeneratedDraft(StrictBaseModel):
@@ -116,5 +145,11 @@ class TrustAuditReport(StrictBaseModel):
     draft_text: str
     faithfulness_score: float
     has_contradiction: bool
-    action: Literal["PASS", "TRIGGER_REWRITE", "WARN"]
+    action: Literal["PASS", "TRIGGER_REWRITE", "WARN", "UNVERIFIED_OPEN_WORLD"] = "PASS"
     audits: List[ClaimAudit] = Field(default_factory=list)
+    provenance_map: Dict[str, ProvenanceCoordinate] = Field(default_factory=dict)
+    grounding_mode: GroundingMode = GroundingMode.CLOSED_WORLD
+    trust_score: Optional[float] = None
+    verdict: Optional[str] = None
+    source_attribution: Optional[str] = None
+    gap_reason: Optional[str] = None

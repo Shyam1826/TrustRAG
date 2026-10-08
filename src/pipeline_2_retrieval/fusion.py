@@ -133,13 +133,11 @@ def apply_rrf(
     if child_chunk_map and user_id is not None:
         sorted_candidates = [
             item for item in sorted_candidates
-            if item[0] not in child_chunk_map or getattr(child_chunk_map[item[0]], "user_id", None) == user_id
+            if item[0] not in child_chunk_map
+            or getattr(child_chunk_map[item[0]], "user_id", None) is None
+            or getattr(child_chunk_map[item[0]], "user_id", None) == user_id
         ]
-    if child_chunk_map and thread_id is not None:
-        sorted_candidates = [
-            item for item in sorted_candidates
-            if item[0] not in child_chunk_map or getattr(child_chunk_map[item[0]], "thread_id", None) == thread_id
-        ]
+    # Note: Do not restrict document chunk retrieval to a specific thread_id
 
     # Apply strict document diversification if child_chunk_map is provided
     if child_chunk_map and getattr(config.retrieval, "enable_document_diversification", True):

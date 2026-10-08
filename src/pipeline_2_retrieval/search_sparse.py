@@ -125,8 +125,7 @@ class BM25Searcher:
                         (chunk.chunk_id, float(score))
                         for chunk, score in zip(self.chunks, scores)
                         if chunk.doc_id == target_doc
-                        and (user_id is None or getattr(chunk, "user_id", None) == user_id)
-                        and (thread_id is None or getattr(chunk, "thread_id", None) == thread_id)
+                        and (user_id is None or getattr(chunk, "user_id", None) is None or getattr(chunk, "user_id", None) == user_id)
                     ]
                     doc_pairs.sort(key=lambda x: x[1], reverse=True)
                     balanced_pairs.extend(doc_pairs[:k_per_doc])
@@ -140,9 +139,7 @@ class BM25Searcher:
         # Pair chunks with BM25 scores and apply single doc_filter and tenant filters
         scored_pairs: List[Tuple[str, float]] = []
         for chunk, score in zip(self.chunks, scores):
-            if user_id is not None and getattr(chunk, "user_id", None) != user_id:
-                continue
-            if thread_id is not None and getattr(chunk, "thread_id", None) != thread_id:
+            if user_id is not None and getattr(chunk, "user_id", None) is not None and getattr(chunk, "user_id", None) != user_id:
                 continue
             if isinstance(doc_filter, str) and doc_filter and chunk.doc_id != doc_filter:
                 continue

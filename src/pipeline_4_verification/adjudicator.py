@@ -1,25 +1,29 @@
 r"""
-================================================================================
+===============================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_4_verification/adjudicator.py
    - Role: Trust scoring, safety gating, and audit report adjudication engine.
    - Purpose: Aligns atomic claims to focused section-breadcrumbed parent premises, performs
-     multi-citation premise unification across multiple referenced documents with distinct
-     delimiters ('\n\n---\n\n'), normalizes meta-document scaffolding from hypotheses, handles
-     comparative meta-claims without false-neutral penalties, executes NLI batch predictions,
+     dynamic citation-to-premise routing mapping `[Doc-k]` tags directly to `contexts[k-1]`,
+     normalizes meta-document and prompt scaffolding from hypotheses, handles multi-citation
+     unification across referenced documents ('\n\n---\n\n'), executes NLI batch predictions,
      evaluates threshold-based verdicts (ENTAILED, CONTRADICTION, NEUTRAL), calculates the
      global faithfulness score, guards against zero-claim audit bypasses, and enforces
-     automated downstream actions (PASS, TRIGGER_REWRITE, WARN). Accommodates mathematical
-     formulas, full parent premise expansion, and unified variable definitions within DeBERTa's
-     512-token limit.
+     automated downstream actions (PASS, TRIGGER_REWRITE, WARN, UNVERIFIED_OPEN_WORLD).
 
 2. INPUT (IP):
    - claims (list[AtomicClaim]): Atomic propositions from `src/pipeline_4_verification/claim_extractor.py`.
-   - context_map (dict[str, Any]): Map of document handles (e.g., "Doc-1") to parent texts or candidates.
+   - contexts / context_map (list or dict): Retrieved context candidates or mapping of document handles.
    - nli_verifier (DebertaNLIVerifier): DeBERTa sequence classifier from `src/pipeline_4_verification/nli_model.py`.
    - draft_text (str, optional): Full synthesized draft text from `src/pipeline_3_generation/`.
 
 3. PROCESS UNDER THE HOOD:
+   - Dynamic Citation-to-Premise Routing:
+     * Parses citation tags dynamically from each claim string (`r'\[Doc-(\d+)\]'`).
+     * Maps extracted citation integer `k` to the specific retrieved context (`contexts[k - 1]`).
+     * If no citation tag is detected, falls back gracefully to evaluating against the top-ranked
+       context (`contexts[0]`) or concatenated fallback corpus.
+     * Strips prompt wrappers, bullet markers, and carrier framing from the hypothesis prior to NLI.
    - Zero-Claim Safety Guard:
      * If `len(claims) == 0`: checks whether `draft_text` contains substantive content or bullet points
        (excluding standard fallback phrases like "does not contain sufficient information").
@@ -27,50 +31,26 @@ r"""
        and `action = "WARN"`.
      * If legitimate fallback response: sets `faithfulness_score = 1.00` and `action = "PASS"`.
    - Meta-Claim Handling:
-     * For claims with `is_meta=True` (e.g. comparative synthesis connectors), assigns `verdict = "ENTAILED"`
-       with `confidence = 1.0` and `cited_premise = "Comparative Meta-Analytical Synthesis"`, avoiding
-       unnecessary literal NLI rejections.
-   - Document Entity Identity Resolution & Premise Formulation:
-     * In `_resolve_context_text(ctx_obj)`: extracts full parent context and prepends document identity
-       `[Document: {doc_id} | Section: {section_name}]\n` if not already present.
-     * In `_clean_hypothesis_for_nli(claim_text)`: strips meta-document scaffolding (e.g. "The resume for X describes...",
-       "The engineering specifications document notes...") into clean affirmative propositions for DeBERTa.
-   - Sentence-Boundary Premise Expansion & 512-Token Bound:
-     * Expands premise windows along clean sentence/paragraph boundaries (`[.!?]\s+`, `\n{2,}`, `\n`) up to
-       `premise_window_size` (1200 characters / max 350 words), focused around the highest keyword match
-       to avoid tail truncation under DeBERTa-v3 512-token limits.
-     * Preserves variable identifiers (`d_model`, `d_k`, `d_v`), mathematical formulas, and numerical parameters.
-   - Multi-Citation Premise Unification:
-     * For multi-citation claims (e.g. `[Doc-1, Doc-2]`), extracts the focused premise window
-       from EACH referenced document context and concatenates them with distinct delimiters
-       (`\n\n---\n\n`) allowing DeBERTa to verify joint claims across multiple sources.
-   - Batch Inference: Queries `nli_verifier.predict_batch()` for cleaned (claim, premise_window) pairs.
-   - Verdict Decision Rule:
-     * If $P(\text{contradiction}) \ge \tau_{\text{contradiction}}$ $\implies$ "CONTRADICTION"
-     * Else if $P(\text{entailment}) \ge \tau_{\text{entailment}}$ $\implies$ "ENTAILED"
-     * Else $\implies$ "NEUTRAL"
-   - Metrics & Gating:
-     * $\text{faithfulness\_score} = \frac{|\{c \mid \text{verdict}(c) = \text{ENTAILED}\}|}{|\text{claims}|}$
-     * $\text{has\_contradiction} = \exists c : \text{verdict}(c) = \text{CONTRADICTION}$
-     * Gating Action:
-       - If `has_contradiction` $\implies$ "TRIGGER_REWRITE"
-       - Else if `faithfulness_score >= 0.80` and not `has_contradiction` $\implies$ "PASS"
-       - Else $\implies$ "WARN"
+     * For claims with `is_meta=True`, assigns `verdict = "ENTAILED"` with `confidence = 1.0`
+       and `cited_premise = "Comparative Meta-Analytical Synthesis"`.
+   - Batch Inference & Adjudication:
+     * Queries `nli_verifier.predict_batch()` for cleaned (claim, premise_window) pairs.
+     * Evaluates $P(\text{contradiction}) \ge \tau_{\text{contradiction}}$ $\implies$ CONTRADICTION,
+       $P(\text{entailment}) \ge \tau_{\text{entailment}}$ $\implies$ ENTAILED, else NEUTRAL.
+   - Safety Action Gating:
+     * Sets `faithfulness_score` as the ratio of entailed claims.
+     * Sets `action`: "TRIGGER_REWRITE" if contradiction exists, "PASS" if score $\ge 0.80$, else "WARN".
 
 4. OUTPUT (OP):
    - TrustAuditReport: Comprehensive audit report containing:
-     * draft_text (str)
-     * faithfulness_score (float)
-     * has_contradiction (bool)
-     * action ("PASS" | "TRIGGER_REWRITE" | "WARN")
-     * audits (list[ClaimAudit])
-   - Consumed by: End-user response dispatcher or automated rewrite pipelines.
+     * draft_text (str), faithfulness_score (float), has_contradiction (bool), action (str), audits (list[ClaimAudit]).
+   - Consumed by: `src/main.py` and downstream self-correction or response dispatchers.
 
 5. LIBRARIES & DEPENDENCIES:
    - re: Standard library regex tokenization and sentence boundary detection.
    - sklearn.feature_extraction.text (ENGLISH_STOP_WORDS): Standard NLP stop words.
    - src.common.config: Centralized decision thresholds and verification settings.
-   - src.common.schemas (AtomicClaim, ClaimAudit, TrustAuditReport): Strict data models.
+   - src.common.schemas (AtomicClaim, ClaimAudit, GroundingMode, TrustAuditReport): Strict data models.
    - src.pipeline_4_verification.nli_model.DebertaNLIVerifier: NLI model interface.
 ================================================================================
 """
@@ -97,6 +77,7 @@ class AuditAdjudicator:
         tau_entailment: Optional[float] = None,
         tau_contradiction: Optional[float] = None,
         premise_window_size: Optional[int] = None,
+        nli_verifier: Optional[Any] = None,
     ) -> None:
         """Initialize adjudicator with decision thresholds.
 
@@ -104,11 +85,13 @@ class AuditAdjudicator:
             tau_entailment: Minimum probability required for ENTAILED verdict (default from config).
             tau_contradiction: Minimum probability required for CONTRADICTION verdict (default from config).
             premise_window_size: Maximum character length for extracted premise window (default from config).
+            nli_verifier: Optional DebertaNLIVerifier instance.
         """
         settings = config.verification
         self.tau_entailment = tau_entailment if tau_entailment is not None else settings.tau_entailment
         self.tau_contradiction = tau_contradiction if tau_contradiction is not None else settings.tau_contradiction
         self.premise_window_size = premise_window_size if premise_window_size is not None else getattr(settings, "premise_window_size", 1200)
+        self.nli_verifier = nli_verifier
 
     def _get_stop_words(self) -> Set[str]:
         """Combine standard English stop words with configured custom stop words."""
@@ -133,6 +116,16 @@ class AuditAdjudicator:
 
         cleaned = claim_text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"').strip()
 
+        # Strip bullet points, numbering, and prompt wrappers
+        cleaned = re.sub(r"^\s*[-*•\u2022]\s*", "", cleaned)
+        cleaned = re.sub(r"^\s*\d+[\.\)]\s*", "", cleaned)
+        cleaned = re.sub(
+            r"^(?:Claim\s*\d*|Assertion\s*\d*|Proposition\s*\d*|Output\s*Draft|Draft\s*Response|Answer)[:\s]+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
         doc_types = r"(?:resume|cv|specifications?|specs?|document|paper|report|contract|agreement|template|candidate|overview|profile|guidelines?|manual|datasheet|workbook|spreadsheet|sheet)"
         verbs = r"(?:states?\s+that|states?|notes?\s+that|notes?|describes?|specifies?\s+that|specifies?|features?|lists?|reports?\s+that|reports?|highlights?|presents?|outlines?|defines?|mentions?|identifies?|focuses\s+on|focuses)"
 
@@ -141,7 +134,7 @@ class AuditAdjudicator:
 
             # 1. Section Scaffolding & Compound Nested Framing
             cleaned = re.sub(
-                r"^Under\s+[^,;:]+,\s*(?:the\s+documented\s+[^:]+:|the\s+document\s+specifies:)\s*",
+                r"^Under\s+(?:Section\s+[A-Za-z0-9._-]+|[^,;:]+)[,:]\s*(?:the\s+document\s+specifies:?\s*|the\s+documented\s+[^:]+:?\s*)?",
                 "",
                 cleaned,
                 flags=re.IGNORECASE,
@@ -186,6 +179,18 @@ class AuditAdjudicator:
 
             # 2. Document Carrier Scaffolding with Doc-X handles
             cleaned = re.sub(
+                r"^According\s+to\s+(?:\[Doc-\d+\]|(?:the\s+)?[A-Za-z0-9_.'/\s\[\]-]+?)[,:]\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"^(?:As\s+(?:stated|noted|specified|detailed)\s+in|Based\s+on|Per)\s+(?:\[Doc-\d+\]|(?:the\s+)?[A-Za-z0-9_.'/\s\[\]-]+?)[,:]\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
                 r"^The\s+candidate\s+in\s+(?:Doc-\d+(?:\s*(?:and|,)\s*)*)+\s+(?:focuses\s+on|lists?|describes?|details?|highlights?):?\s*",
                 "",
                 cleaned,
@@ -227,12 +232,10 @@ class AuditAdjudicator:
                 cleaned,
                 flags=re.IGNORECASE,
             )
-            cleaned = re.sub(
-                r"^According\s+to\s+(?:the\s+)?[A-Za-z0-9_.'/\s-]+?[,:]\s*",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            )
+
+            # 6. Inline and trailing citation stripping from hypothesis
+            cleaned = re.sub(r"^\[Doc-\d+\]\s*:?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*\[Doc-\d+\]", "", cleaned)
 
             # Strip leading/trailing punctuation and whitespace (preserving trailing period)
             cleaned = re.sub(r"^[\s,;:.-]+|[\s,;:-]+$", "", cleaned).strip()
@@ -411,22 +414,37 @@ class AuditAdjudicator:
     def adjudicate(
         self,
         claims: List[AtomicClaim],
-        context_map: Dict[str, Any],
-        nli_verifier: Any,
+        context_map: Optional[Dict[str, Any]] = None,
+        nli_verifier: Optional[Any] = None,
         draft_text: str = "",
         batch_size: int = 32,
+        contexts: Optional[List[Any]] = None,
     ) -> TrustAuditReport:
         """Audit atomic claims against cited contexts and produce a TrustAuditReport.
 
         Args:
             claims: List of AtomicClaim instances to verify.
             context_map: Mapping from document tags (e.g. 'Doc-1') to passages or candidates.
-            nli_verifier: DebertaNLIVerifier instance.
+            nli_verifier: Optional DebertaNLIVerifier instance.
             draft_text: Optional full synthesized draft text.
+            batch_size: Batch size for model inference.
+            contexts: Optional sequence of candidate objects for direct 1-based citation index mapping.
 
         Returns:
             TrustAuditReport containing per-claim audits, faithfulness score, and action verdict.
         """
+        if context_map is None and contexts is not None:
+            context_map = {f"Doc-{i}": c for i, c in enumerate(contexts, start=1)}
+        elif context_map is None:
+            context_map = {}
+
+        context_list = list(contexts) if contexts is not None else list(context_map.values())
+
+        verifier = nli_verifier if nli_verifier is not None else getattr(self, "nli_verifier", None)
+        if verifier is None:
+            from src.pipeline_4_verification.nli_model import DebertaNLIVerifier
+            verifier = DebertaNLIVerifier()
+
         if not claims:
             # Guard against zero-claim audit bypass: check if draft contains substantive assertions
             cleaned_draft = re.sub(r"[*_~`#\-•\s]+", " ", draft_text or "").strip().lower()
@@ -453,7 +471,7 @@ class AuditAdjudicator:
                     audits=[],
                 )
 
-        fallback_corpus = "\n\n---\n\n".join(self._resolve_context_text(v) for v in context_map.values()) if context_map else ""
+        fallback_corpus = "\n\n---\n\n".join(self._resolve_context_text(v) for v in context_list) if context_list else ""
 
         audits: List[ClaimAudit] = []
         batch_hypotheses: List[str] = []
@@ -475,12 +493,34 @@ class AuditAdjudicator:
                 audits.append(meta_audit)
                 continue
 
-            # Determine target document handles for this claim
-            doc_handles = list(getattr(claim, "cited_doc_ids", []))
-            if not doc_handles and claim.cited_doc_id:
-                doc_handles = [h.strip() for h in re.findall(r"Doc-\d+", claim.cited_doc_id)]
-                if not doc_handles and claim.cited_doc_id in context_map:
-                    doc_handles = [claim.cited_doc_id]
+            # 1. Parse citation tags dynamically from claim string or explicit claim attributes
+            cit_matches = re.findall(r"\[Doc-(\d+)\]", claim.claim_text, re.IGNORECASE)
+            if not cit_matches:
+                cit_matches = re.findall(r"\bDoc-(\d+)\b", claim.claim_text, re.IGNORECASE)
+            if not cit_matches and getattr(claim, "cited_doc_ids", None):
+                for h in claim.cited_doc_ids:
+                    m = re.search(r"Doc-(\d+)", str(h), re.IGNORECASE)
+                    if m:
+                        cit_matches.append(m.group(1))
+            if not cit_matches and getattr(claim, "cited_doc_id", None):
+                m = re.search(r"Doc-(\d+)", str(claim.cited_doc_id), re.IGNORECASE)
+                if m:
+                    cit_matches.append(m.group(1))
+
+            target_premise = ""
+            target_handle = "General"
+
+            valid_indices: List[int] = []
+            for num_str in cit_matches:
+                try:
+                    k = int(num_str)
+                    if 1 <= k <= len(context_list):
+                        valid_indices.append(k)
+                except ValueError:
+                    pass
+
+            doc_handles = [f"Doc-{k}" for k in valid_indices]
+            clean_hyp = self._clean_hypothesis_for_nli(claim.claim_text)
 
             # Multi-Citation Comparative Decomposition:
             # If claim cites multiple discrete documents and contains comparative conjunctions,
@@ -489,8 +529,9 @@ class AuditAdjudicator:
                 sub_parts = [p.strip() for p in self._COMPARATIVE_SPLIT_REGEX.split(claim.claim_text) if p.strip()]
                 if len(sub_parts) > 1:
                     for s_idx, part in enumerate(sub_parts):
-                        target_handle = doc_handles[min(s_idx, len(doc_handles) - 1)]
-                        raw_doc_ctx = self._resolve_context_text(context_map.get(target_handle, fallback_corpus))
+                        target_k = valid_indices[min(s_idx, len(valid_indices) - 1)]
+                        target_handle = f"Doc-{target_k}"
+                        raw_doc_ctx = self._resolve_context_text(context_list[target_k - 1])
                         clean_sub = self._clean_hypothesis_for_nli(part)
                         p_win = self._extract_premise_window(clean_sub, raw_doc_ctx)
                         target_premise = p_win if p_win else raw_doc_ctx
@@ -501,27 +542,35 @@ class AuditAdjudicator:
                     continue
 
             # Standard Single or Unified Multi-Citation evaluation
-            if len(doc_handles) > 1:
+            if len(valid_indices) == 1:
+                k = valid_indices[0]
+                target_handle = f"Doc-{k}"
+                target_ctx = context_list[k - 1]
+                raw_context = self._resolve_context_text(target_ctx)
+                p_win = self._extract_premise_window(clean_hyp, raw_context)
+                target_premise = p_win if p_win else raw_context
+            elif len(valid_indices) > 1:
                 unified_parts = []
-                for handle in doc_handles:
-                    raw_doc_ctx = self._resolve_context_text(context_map.get(handle, ""))
-                    if raw_doc_ctx:
-                        p_win = self._extract_premise_window(claim.claim_text, raw_doc_ctx)
-                        unified_parts.append(f"[{handle}]: {p_win or raw_doc_ctx}")
+                for k in valid_indices:
+                    raw_context = self._resolve_context_text(context_list[k - 1])
+                    if raw_context:
+                        p_win = self._extract_premise_window(clean_hyp, raw_context)
+                        unified_parts.append(f"[Doc-{k}]: {p_win or raw_context}")
                 target_premise = "\n\n---\n\n".join(unified_parts) if unified_parts else fallback_corpus
                 target_handle = ", ".join(doc_handles)
-            elif len(doc_handles) == 1:
-                target_handle = doc_handles[0]
-                raw_context = self._resolve_context_text(context_map.get(target_handle, fallback_corpus))
-                p_win = self._extract_premise_window(claim.claim_text, raw_context)
-                target_premise = p_win if p_win else raw_context
             else:
-                target_handle = "General"
-                raw_fallback = self._resolve_context_text(fallback_corpus)
-                p_win = self._extract_premise_window(claim.claim_text, raw_fallback)
-                target_premise = p_win if p_win else raw_fallback
+                # No citation tag detected: fall back to top-ranked context or concatenated top contexts
+                if context_list:
+                    target_handle = "Doc-1"
+                    raw_context = self._resolve_context_text(context_list[0])
+                    p_win = self._extract_premise_window(clean_hyp, raw_context)
+                    target_premise = p_win if p_win else raw_context
+                else:
+                    target_handle = "General"
+                    raw_fallback = self._resolve_context_text(fallback_corpus)
+                    p_win = self._extract_premise_window(clean_hyp, raw_fallback)
+                    target_premise = p_win if p_win else raw_fallback
 
-            clean_hyp = self._clean_hypothesis_for_nli(claim.claim_text)
             batch_hypotheses.append(clean_hyp)
             batch_premises.append(target_premise)
             batch_meta.append((idx, 0, 1, target_handle, target_premise))
@@ -529,13 +578,13 @@ class AuditAdjudicator:
         # 2. Run batch NLI inference for non-meta claims
         if batch_hypotheses:
             try:
-                predictions = nli_verifier.predict_batch(
+                predictions = verifier.predict_batch(
                     claims=batch_hypotheses,
                     premises=batch_premises,
                     batch_size=batch_size,
                 )
             except TypeError:
-                predictions = nli_verifier.predict_batch(
+                predictions = verifier.predict_batch(
                     claims=batch_hypotheses,
                     premises=batch_premises,
                 )
@@ -633,4 +682,95 @@ class AuditAdjudicator:
             action=action,
             audits=audits,
         )
+
+    def verify(
+        self,
+        claims: List[AtomicClaim],
+        context_map: Optional[Dict[str, Any]] = None,
+        nli_verifier: Optional[Any] = None,
+        draft_text: str = "",
+        batch_size: int = 32,
+        contexts: Optional[List[Any]] = None,
+    ) -> TrustAuditReport:
+        """Alias for adjudicate conforming to standard verification interface."""
+        return self.adjudicate(
+            claims=claims,
+            context_map=context_map,
+            nli_verifier=nli_verifier,
+            draft_text=draft_text,
+            batch_size=batch_size,
+            contexts=contexts,
+        )
+
+    def verify_claims(
+        self,
+        claims: List[AtomicClaim],
+        contexts: Any,
+        nli_verifier: Optional[Any] = None,
+        draft_text: str = "",
+        batch_size: int = 32,
+    ) -> TrustAuditReport:
+        """Verify atomic claims by dynamically routing each claim's premise to its cited context index."""
+        if isinstance(contexts, list):
+            context_list = contexts
+            context_map = {f"Doc-{i}": c for i, c in enumerate(contexts, start=1)}
+        elif isinstance(contexts, dict):
+            context_map = contexts
+            context_list = list(contexts.values())
+        else:
+            context_list = [contexts]
+            context_map = {"Doc-1": contexts}
+
+        return self.adjudicate(
+            claims=claims,
+            context_map=context_map,
+            nli_verifier=nli_verifier,
+            draft_text=draft_text,
+            batch_size=batch_size,
+            contexts=context_list,
+        )
+
+
+def verify(
+    adjudicator: AuditAdjudicator,
+    claims: List[AtomicClaim],
+    context_map: Optional[Dict[str, Any]] = None,
+    nli_verifier: Optional[Any] = None,
+    draft_text: str = "",
+    batch_size: int = 32,
+    contexts: Optional[List[Any]] = None,
+) -> TrustAuditReport:
+    """Verify atomic claims using the provided adjudicator and NLI verifier."""
+    return adjudicator.adjudicate(
+        claims=claims,
+        context_map=context_map,
+        nli_verifier=nli_verifier,
+        draft_text=draft_text,
+        batch_size=batch_size,
+        contexts=contexts,
+    )
+
+
+def verify_claims(
+    adjudicator: AuditAdjudicator,
+    claims: List[AtomicClaim],
+    contexts: Any,
+    nli_verifier: Optional[Any] = None,
+    draft_text: str = "",
+    batch_size: int = 32,
+) -> TrustAuditReport:
+    """Verify claims dynamically routed to cited context indices."""
+    return adjudicator.verify_claims(
+        claims=claims,
+        contexts=contexts,
+        nli_verifier=nli_verifier,
+        draft_text=draft_text,
+        batch_size=batch_size,
+    )
+
+
+# Alias Adjudicator to AuditAdjudicator
+Adjudicator = AuditAdjudicator
+
+
 

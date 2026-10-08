@@ -2,50 +2,45 @@ r"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/main.py
-   - Role: End-to-end System Orchestrator and Incremental Ingestion Controller for TrustRAG.
-   - Purpose: Coordinates all 5 modular pipelines (Ingestion & DuckDB Tabular Store,
+   - Role: End-to-end System Orchestrator, Dual-Mode Grounding, and Ingestion Controller for TrustRAG.
+   - Purpose: Coordinates all modular pipelines (Ingestion & DuckDB Tabular Store,
      Hybrid Retrieval & Tabular SQL Routing, Closed-World Generation, Claim-Level
-     NLI Verification, and Automated Self-Correction) into a unified, enterprise-scale,
-     high-assurance RAG engine supporting incremental SHA-256 manifest caching,
-     recursive multi-depth document discovery, and deterministic tabular queries.
+     NLI Verification, Automated Self-Correction, and Dynamic Knowledge Gap Detection) into
+     a unified, enterprise-scale, high-assurance RAG engine supporting incremental SHA-256
+     manifest caching, dynamic cache invalidation, and Dual-Mode Open-World Fallback routing.
 
 2. INPUT (IP):
    - Ingestion: pdf_path (str) or raw_dir (str) pointing to document files or subfolder trees.
    - Querying: user_query (str) representing natural language user questions.
 
 3. PROCESS UNDER THE HOOD:
+   - Dynamic Knowledge Gap Detection & Dual-Mode Routing:
+     * Evaluates candidate retrieval density, score confidence floors, and lexical overlap
+       prior to generation via `KnowledgeGapDetector`.
+     * Closed-World Mode: Executes context compaction, XML-constrained synthesis, inline citation
+       parsing, and claim-level DeBERTa NLI audits when candidate confidence is sufficient.
+     * Open-World Fallback Mode: Triggers when retrieval produces no candidates, when candidate scores
+       fall below the empirical floor (-6.0) lacking query overlap, or when closed-world generation
+       yields an uninformative refusal. Generates disclaimed parametric answers and marks reports
+       as unverified (Trust Score 0.0).
    - Incremental & Recursive Ingestion Flow:
-     * Recursively traverses subfolders in `data/raw/` across configured supported extensions.
-     * Registers structured tabular files (CSV, TSV, XLSX, XLS) into in-process DuckDB tables.
-     * Derives collision-safe relative `doc_id`s (e.g. `legal/2026/nda`).
-     * Inspects `IngestionManifest`: skips unchanged files based on SHA-256 fingerprinting.
-     * On file modifications: deletes stale Qdrant points via `vector_store.delete_document()`.
-     * Extracts pages, applies domain-agnostic structural section chunking with breadcrumbs.
-     * Computes dense embeddings and sparse token dictionaries.
-     * Indexes into Qdrant (`trustrag_enterprise`) and updates `IngestionManifest`.
-     * Maintains BM25 search index and dynamic entity aliases.
+     * Recursively traverses subfolders across supported formats (PDF, CSV, XLSX, TXT, PNG).
+     * Registers structured tabular files into in-process DuckDB tables.
+     * Inspects `IngestionManifest`: skips unchanged files based on SHA-256 fingerprinting and parser version.
+     * Dynamic Cache Invalidation: invalidates stale cache when parser version evolves or when
+       `data/processed/ingestion_manifest.json` is reset/deleted, clearing stale Qdrant points.
    - Query, Tabular Routing & Verification Flow:
      * Dispatches query via `retrieve()`: detects relational tabular intent targeting DuckDB.
-     * Generates schema-aware SQL with dynamic column reflection and `LIMIT 15` safety bound.
-     * Emits structured rows as standard `RetrievalCandidate` objects; merges with narrative
-       candidates if cross-document comparison is requested.
-     * For multi-faceted queries: decomposes into focused sub-queries, executes dense/sparse/tabular
-       search concurrently via `ThreadPoolExecutor(max_workers=4)`, and independently reranks
-       each sub-query candidate pool to eliminate cross-encoder dilution.
-     * Applies round-robin interleaving and strict per-document quota ceilings across sub-queries
-       to guarantee multi-source balance (preventing single-document dominance).
-     * Dynamically compacts narrative context to target sentence spans via `ContextCompactor`,
-       enforcing a hard 4,000-character ceiling (<2,500 tokens) in prompt construction.
-     * Synthesizes draft response with active generator backend (Groq, Gemini, Ollama, Mock).
-     * Validates citations and extracts section-anchored atomic claims.
-     * Audits claims against unified premise windows via DeBERTa-v3 and `AuditAdjudicator`.
-     * If ungrounded or contradictory claims exist (WARN / TRIGGER_REWRITE): executes a 1-pass
-       automated corrective rewrite loop to produce a 100% faithful final report.
-     * Emits `TrustAuditReport`.
+     * Emits structured rows as standard `RetrievalCandidate` objects.
+     * Multi-faceted query decomposition and concurrent dense/sparse/tabular search.
+     * Synthesizes draft response, extracts section-anchored claims, and verifies via DeBERTa.
+     * If ungrounded or contradictory claims exist: executes 1-pass automated self-correction.
+     * Enriches report with exact physical PDF bounding boxes and table lineage.
 
 4. OUTPUT (OP):
    - TrustAuditReport: Strictly typed Pydantic audit report containing draft text,
-     faithfulness score, per-claim NLI audits, and automated safety gate action.
+     faithfulness score, per-claim NLI audits, automated safety gate action, grounding_mode
+     (CLOSED_WORLD or OPEN_WORLD_FALLBACK), trust_score, verdict, and provenance_map.
 
 5. LIBRARIES & DEPENDENCIES:
    - concurrent.futures: Parallel dense/sparse execution.
@@ -66,7 +61,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
 from src.common.config import config
-from src.common.schemas import ChildChunk, ParentChunk, RetrievalCandidate, TrustAuditReport
+from src.common.schemas import ChildChunk, GroundingMode, ParentChunk, ProvenanceCoordinate, RetrievalCandidate, TrustAuditReport
+from src.common.tracer import global_tracer
 from src.pipeline_1_ingestion.chunker import create_hierarchical_chunks
 from src.pipeline_1_ingestion.discover import discover_raw_documents
 from src.pipeline_1_ingestion.embedder import DualEmbedder
@@ -79,6 +75,7 @@ from src.database.connection import init_db
 from src.database.repository import DatabaseRepository
 from src.pipeline_2_retrieval.conversational_rewriter import ConversationalQueryRewriter
 from src.pipeline_2_retrieval.fusion import apply_rrf, is_comparative_query
+from src.pipeline_2_retrieval.gap_detector import KnowledgeGapDetector
 from src.pipeline_2_retrieval.reranker import CrossEncoderReranker
 from src.pipeline_2_retrieval.rewriter import QueryTransformer
 from src.pipeline_2_retrieval.search_dense import retrieve_dense
@@ -149,6 +146,9 @@ class TrustRAGPipeline:
             generator=self.generator,
         )
 
+        # Knowledge Gap Detector (Dual-Mode Safety Gating)
+        self.gap_detector = KnowledgeGapDetector()
+
         # Pipeline 4: Verification & Adjudication
         self.claim_extractor = AtomicClaimExtractor()
         self.nli_verifier = DebertaNLIVerifier()
@@ -164,6 +164,12 @@ class TrustRAGPipeline:
 
         # Conversational Query Reformulation
         self.conversational_rewriter = ConversationalQueryRewriter(generator=self.generator)
+
+        # Retrieval Diagnostics & Execution Tracer State
+        self.last_route = "Hybrid Narrative"
+        self.tracer = global_tracer
+        self.last_trace: List[Dict[str, Any]] = []
+        self.startup_trace: List[Dict[str, Any]] = []
 
     def _extract_entity_aliases(self, pages: List[Dict], assigned_doc_id: str) -> List[str]:
         """Extract candidate entity identifiers and document aliases using domain-agnostic NLP filtering."""
@@ -237,9 +243,19 @@ class TrustRAGPipeline:
             computed_rel_str = str(rel).replace("\\", "/")
             computed_folders = [p for p in rel.parent.parts if p and p != "."]
         except (ValueError, Exception):
-            computed_doc_id = path.stem
-            computed_rel_str = path.name
-            computed_folders = []
+            try:
+                rel = path.relative_to("data")
+                if rel.parts and rel.parts[0] == "raw" and len(rel.parts) > 1:
+                    rel_for_doc = Path(*rel.parts[1:])
+                else:
+                    rel_for_doc = rel
+                computed_doc_id = str(rel_for_doc.with_suffix("")).replace("\\", "/")
+                computed_rel_str = str(rel_for_doc).replace("\\", "/")
+                computed_folders = [p for p in rel_for_doc.parent.parts if p and p != "."]
+            except Exception:
+                computed_doc_id = path.stem
+                computed_rel_str = path.name
+                computed_folders = []
 
         assigned_doc_id = doc_id or computed_doc_id
         doc_rel_path = relative_path or computed_rel_str
@@ -258,8 +274,8 @@ class TrustRAGPipeline:
             except Exception as e:
                 print(f"[TabularStore] Warning: Failed to register {path.name} in DuckDB: {e}")
 
-        # Step 0b: Check Incremental Manifest Fingerprint (only when no tenant is specified)
-        if user_id is None and not force_reindex and self.manifest.is_indexed_and_current(path, assigned_doc_id):
+        # Step 0b: Check Incremental Manifest Fingerprint (for default or unassigned tenants)
+        if (user_id is None or user_id == "default_user") and not force_reindex and self.manifest.is_indexed_and_current(path, assigned_doc_id):
             print(f"[Ingestion] '{assigned_doc_id}' unchanged (already indexed) -> Skipping.")
             self.known_doc_ids.add(assigned_doc_id)
             return []
@@ -277,7 +293,13 @@ class TrustRAGPipeline:
         }
 
         # Step 1: Extract pages/sheets via format-specific reader
-        pages = read_document(path, doc_id=assigned_doc_id)
+        pages = read_document(
+            path,
+            doc_id=assigned_doc_id,
+            tabular_store=self.tabular_store,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
         if not pages:
             print(f"Warning: No readable text extracted from {path.name}.")
             return []
@@ -331,7 +353,7 @@ class TrustRAGPipeline:
         self.bm25_searcher = BM25Searcher(self.all_child_chunks)
 
         # Step 6: Record in Manifest
-        if user_id is None:
+        if user_id is None or user_id == "default_user":
             self.manifest.record_indexed(
                 path=path,
                 doc_id=assigned_doc_id,
@@ -384,8 +406,16 @@ class TrustRAGPipeline:
             List of all indexed ChildChunk models.
         """
         exts = supported_extensions or set(config.ingestion.supported_extensions)
-        discovered = discover_raw_documents(raw_dir=raw_dir, supported_extensions=exts)
+        with self.tracer.trace_step("Document Discovery", "src/pipeline_1_ingestion/reader.py", "discover_raw_documents"):
+            discovered = discover_raw_documents(raw_dir=raw_dir, supported_extensions=exts)
         print(f"[Ingestion] Discovered {len(discovered)} document(s) across subfolders in '{raw_dir}'.")
+
+        if force_reindex:
+            print("[Ingestion] Force re-index requested: invalidating manifest cache.")
+            self.manifest.invalidate()
+            self.all_child_chunks.clear()
+            self.child_chunk_map.clear()
+            self.known_doc_ids.clear()
 
         all_indexed: List[ChildChunk] = []
         indexed_count = 0
@@ -405,10 +435,21 @@ class TrustRAGPipeline:
                     except Exception as e:
                         print(f"[TabularStore] Warning: Failed to register {file_path.name} in DuckDB: {e}")
 
-                if user_id is None and not force_reindex and self.manifest.is_indexed_and_current(file_path, doc_id):
+                if (user_id is None or user_id == "default_user") and not force_reindex and self.manifest.is_indexed_and_current(file_path, doc_id):
                     print(f"[Ingestion] '{doc_id}' unchanged (already indexed) -> Skipping.")
                     self.known_doc_ids.add(doc_id)
                     skipped_count += 1
+                    if file_path.suffix.lower() == ".pdf":
+                        try:
+                            extract_pdf_pages(
+                                str(file_path),
+                                doc_id=doc_id,
+                                tabular_store=self.tabular_store,
+                                user_id=user_id,
+                                thread_id=thread_id,
+                            )
+                        except Exception:
+                            pass
                 else:
                     chunks = self.ingest_document(
                         str(file_path),
@@ -439,6 +480,7 @@ class TrustRAGPipeline:
             self.bm25_searcher = BM25Searcher(self.all_child_chunks)
 
         print(f"[Ingestion] Ingestion summary: {len(discovered)} scanned, {indexed_count} indexed/re-indexed, {skipped_count} unchanged.")
+        self.startup_trace = self.tracer.get_trace()
         return all_indexed
 
     def _execute_sub_query(
@@ -506,60 +548,64 @@ class TrustRAGPipeline:
             List of reranked RetrievalCandidate models.
         """
         top_k_dense = config.retrieval.top_k_dense
-        doc_filter, matched_entities = self.rewriter.extract_doc_filter(
-            user_query,
-            list(self.known_doc_ids),
-            doc_entity_map=self.doc_entity_map,
-        )
-        clean_query = self.rewriter.transform(user_query, entities_to_strip=matched_entities)
-        query_tokens = [t.lower() for t in clean_query.split() if t.strip()]
+        with self.tracer.trace_step("Query Analysis", "src/pipeline_2_retrieval/rewriter.py", "rewrite_query"):
+            doc_filter, matched_entities = self.rewriter.extract_doc_filter(
+                user_query,
+                list(self.known_doc_ids),
+                doc_entity_map=self.doc_entity_map,
+            )
+            clean_query = self.rewriter.transform(user_query, entities_to_strip=matched_entities)
+            query_tokens = [t.lower() for t in clean_query.split() if t.strip()]
 
         dense_results: List[Tuple[str, int, float]] = []
         sparse_results: List[Tuple[str, int, float]] = []
 
-        if self.all_child_chunks or (self.local_store and self.local_store.client):
-            dense_results = retrieve_dense(
-                clean_query,
-                self.embedder,
-                self.local_store.client,
-                top_k=top_k_dense,
+        with self.tracer.trace_step("Dense/Sparse Search", "src/pipeline_2_retrieval/search_dense.py", "search"):
+            if self.all_child_chunks or (self.local_store and self.local_store.client):
+                dense_results = retrieve_dense(
+                    clean_query,
+                    self.embedder,
+                    self.local_store.client,
+                    top_k=top_k_dense,
+                    doc_filter=doc_filter,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                )
+
+            if self.bm25_searcher and query_tokens:
+                sparse_results = self.bm25_searcher.search(
+                    query_tokens,
+                    top_k=top_k_dense,
+                    doc_filter=doc_filter,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                )
+
+        with self.tracer.trace_step("Rank Fusion", "src/pipeline_2_retrieval/fusion.py", "fuse_rankings"):
+            fused_candidates = apply_rrf(
+                dense_ranks=dense_results,
+                sparse_ranks=sparse_results,
+                k=config.retrieval.rrf_k,
+                top_n=top_k_dense,
+                child_chunk_map=self.child_chunk_map,
+                query=clean_query,
                 doc_filter=doc_filter,
                 user_id=user_id,
                 thread_id=thread_id,
             )
+            candidate_cids = [cid for cid, _ in fused_candidates]
 
-        if self.bm25_searcher and query_tokens:
-            sparse_results = self.bm25_searcher.search(
-                query_tokens,
-                top_k=top_k_dense,
+        with self.tracer.trace_step("Reranking", "src/pipeline_2_retrieval/reranker.py", "rerank"):
+            return self.reranker.rerank_and_resolve(
+                query=clean_query,
+                candidate_child_ids=candidate_cids,
+                child_chunk_map=self.child_chunk_map,
+                local_store=self.local_store,
+                top_k=config.retrieval.top_k_rerank,
                 doc_filter=doc_filter,
                 user_id=user_id,
                 thread_id=thread_id,
             )
-
-        fused_candidates = apply_rrf(
-            dense_ranks=dense_results,
-            sparse_ranks=sparse_results,
-            k=config.retrieval.rrf_k,
-            top_n=top_k_dense,
-            child_chunk_map=self.child_chunk_map,
-            query=clean_query,
-            doc_filter=doc_filter,
-            user_id=user_id,
-            thread_id=thread_id,
-        )
-        candidate_cids = [cid for cid, _ in fused_candidates]
-
-        return self.reranker.rerank_and_resolve(
-            query=clean_query,
-            candidate_child_ids=candidate_cids,
-            child_chunk_map=self.child_chunk_map,
-            local_store=self.local_store,
-            top_k=config.retrieval.top_k_rerank,
-            doc_filter=doc_filter,
-            user_id=user_id,
-            thread_id=thread_id,
-        )
 
     def retrieve(
         self,
@@ -638,8 +684,10 @@ class TrustRAGPipeline:
                             seen_ids.add(cid)
                             merged_candidates.append(cand)
                             if len(merged_candidates) >= top_k_rerank:
+                                self.last_route = "DuckDB SQL | Hybrid Narrative" if any(c.match_type == "tabular_sql" for c in merged_candidates) else "Hybrid Narrative"
                                 return merged_candidates
 
+            self.last_route = "DuckDB SQL | Hybrid Narrative" if any(c.match_type == "tabular_sql" for c in merged_candidates) else "Hybrid Narrative"
             return merged_candidates[:top_k_rerank]
 
         # Branch B: Solitary Query Execution
@@ -649,6 +697,7 @@ class TrustRAGPipeline:
             try:
                 tab_candidates = self.tabular_engine.query(user_query, user_id=user_id, thread_id=thread_id)
                 if tab_candidates:
+                    self.last_route = "DuckDB SQL"
                     return tab_candidates
             except Exception as e:
                 print(f"[TabularEngine] Query execution failed: {e}. Falling back to narrative search.")
@@ -657,20 +706,22 @@ class TrustRAGPipeline:
         all_dense_ranks: List[Tuple[str, int, float]] = []
         all_sparse_ranks: List[Tuple[str, int, float]] = []
 
-        doc_filter, matched_entities = self.rewriter.extract_doc_filter(
-            user_query,
-            list(self.known_doc_ids),
-            doc_entity_map=self.doc_entity_map,
-        )
-        clean_query = self.rewriter.transform(user_query, entities_to_strip=matched_entities)
+        with self.tracer.trace_step("Query Analysis", "src/pipeline_2_retrieval/rewriter.py", "rewrite_query"):
+            doc_filter, matched_entities = self.rewriter.extract_doc_filter(
+                user_query,
+                list(self.known_doc_ids),
+                doc_entity_map=self.doc_entity_map,
+            )
+            clean_query = self.rewriter.transform(user_query, entities_to_strip=matched_entities)
 
         # Execute dense, sparse, and tabular checks concurrently
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            fut = executor.submit(self._execute_sub_query, user_query, top_k_dense, user_id, thread_id)
-            tab_cands, dense_r, sparse_r = fut.result()
-            all_tabular_candidates.extend(tab_cands)
-            all_dense_ranks.extend(dense_r)
-            all_sparse_ranks.extend(sparse_r)
+        with self.tracer.trace_step("Dense/Sparse Search", "src/pipeline_2_retrieval/search_dense.py", "search"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                fut = executor.submit(self._execute_sub_query, user_query, top_k_dense, user_id, thread_id)
+                tab_cands, dense_r, sparse_r = fut.result()
+                all_tabular_candidates.extend(tab_cands)
+                all_dense_ranks.extend(dense_r)
+                all_sparse_ranks.extend(sparse_r)
 
         # Thread-safe quota deduplication of tabular candidates
         deduped_tabular: List[RetrievalCandidate] = []
@@ -684,38 +735,43 @@ class TrustRAGPipeline:
         # Reciprocal Rank Fusion on narrative dense/sparse ranks
         narrative_candidates: List[RetrievalCandidate] = []
         if all_dense_ranks or all_sparse_ranks:
-            fused_candidates = apply_rrf(
-                dense_ranks=all_dense_ranks,
-                sparse_ranks=all_sparse_ranks,
-                k=config.retrieval.rrf_k,
-                top_n=top_k_dense,
-                child_chunk_map=self.child_chunk_map,
-                query=clean_query,
-                doc_filter=doc_filter,
-                user_id=user_id,
-                thread_id=thread_id,
-            )
-            candidate_cids = [cid for cid, _ in fused_candidates]
+            with self.tracer.trace_step("Rank Fusion", "src/pipeline_2_retrieval/fusion.py", "fuse_rankings"):
+                fused_candidates = apply_rrf(
+                    dense_ranks=all_dense_ranks,
+                    sparse_ranks=all_sparse_ranks,
+                    k=config.retrieval.rrf_k,
+                    top_n=top_k_dense,
+                    child_chunk_map=self.child_chunk_map,
+                    query=clean_query,
+                    doc_filter=doc_filter,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                )
+                candidate_cids = [cid for cid, _ in fused_candidates]
 
             # Cross-Encoder Reranking and Neighbor Expansion
-            narrative_candidates = self.reranker.rerank_and_resolve(
-                query=clean_query,
-                candidate_child_ids=candidate_cids,
-                child_chunk_map=self.child_chunk_map,
-                local_store=self.local_store,
-                top_k=top_k_rerank,
-                doc_filter=doc_filter,
-                user_id=user_id,
-                thread_id=thread_id,
-            )
+            with self.tracer.trace_step("Reranking", "src/pipeline_2_retrieval/reranker.py", "rerank"):
+                narrative_candidates = self.reranker.rerank_and_resolve(
+                    query=clean_query,
+                    candidate_child_ids=candidate_cids,
+                    child_chunk_map=self.child_chunk_map,
+                    local_store=self.local_store,
+                    top_k=top_k_rerank,
+                    doc_filter=doc_filter,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                )
 
         # Merge candidates: tabular candidates + narrative candidates
         if deduped_tabular and narrative_candidates:
+            self.last_route = "DuckDB SQL | Hybrid Narrative"
             merged = deduped_tabular + narrative_candidates
             return merged[:top_k_rerank]
         elif deduped_tabular:
+            self.last_route = "DuckDB SQL"
             return deduped_tabular[:top_k_rerank]
         else:
+            self.last_route = "Hybrid Narrative"
             return narrative_candidates
 
     def ask(
@@ -734,33 +790,63 @@ class TrustRAGPipeline:
         Returns:
             TrustAuditReport containing draft text, per-claim audits, and safety action.
         """
+        self.tracer.clear()
+
         if not user_query or not user_query.strip():
+            self.last_trace = self.tracer.get_trace()
             return TrustAuditReport(
                 draft_text="",
                 faithfulness_score=1.0,
                 has_contradiction=False,
                 action="PASS",
                 audits=[],
+                grounding_mode=GroundingMode.CLOSED_WORLD,
+                trust_score=1.0,
+                verdict="PASS",
+                source_attribution="EMPTY_QUERY",
             )
 
         # 1. Execute Unified Retrieval (Tabular + Narrative Fusion with Sub-Query Decomp)
         top_contexts = self.retrieve(user_query, user_id=user_id, thread_id=thread_id)
         self.last_retrieved_contexts = top_contexts
 
-        if not top_contexts:
-            return TrustAuditReport(
-                draft_text="No relevant context could be retrieved to answer the question.",
-                faithfulness_score=1.0,
+        # Dynamic Knowledge Gap Detection & Dual-Mode Routing
+        gap_detected, gap_reason = self.gap_detector.detect_gap(user_query, top_contexts)
+
+        draft_text = ""
+        if not gap_detected:
+            # 2. Taxonomy-Strict Prompt Construction & Context Compaction
+            with self.tracer.trace_step("Context Compaction", "src/pipeline_3_generation/compaction.py", "compact"):
+                prompt = build_rag_prompt(query=user_query.strip(), contexts=top_contexts)
+
+            # 3. Closed-World Draft Generation
+            with self.tracer.trace_step("Answer Generation", "src/pipeline_3_generation/generator.py", "generate_answer"):
+                draft_text = self.generator.generate_answer(prompt)
+
+            # Check if closed-world generator outputs an uninformative refusal response
+            if self.gap_detector.is_refusal_response(draft_text):
+                gap_detected = True
+                gap_reason = "CLOSED_WORLD_REFUSAL"
+
+        if gap_detected:
+            # Open-World Fallback Mode
+            with self.tracer.trace_step("Open-World Generation", "src/pipeline_3_generation/generator.py", "generate_open_world"):
+                open_world_draft = self.generator.generate_open_world(user_query)
+
+            audit_report = TrustAuditReport(
+                draft_text=open_world_draft,
+                faithfulness_score=0.0,
                 has_contradiction=False,
-                action="PASS",
+                action="UNVERIFIED_OPEN_WORLD",
                 audits=[],
+                grounding_mode=GroundingMode.OPEN_WORLD_FALLBACK,
+                trust_score=0.0,
+                verdict="UNVERIFIED_OPEN_WORLD",
+                source_attribution="OPEN_WORLD_GENERAL_KNOWLEDGE",
+                gap_reason=gap_reason,
             )
-
-        # 2. Taxonomy-Strict Prompt Construction
-        prompt = build_rag_prompt(query=user_query.strip(), contexts=top_contexts)
-
-        # 3. Draft Generation
-        draft_text = self.generator.generate(prompt)
+            self.last_trace = self.tracer.get_trace()
+            return audit_report
 
         # 4. Citation Parsing & Boundary Validation (with Unicode normalization)
         generated_draft = validate_and_parse_citations(
@@ -778,13 +864,15 @@ class TrustRAGPipeline:
             for idx, context in enumerate(top_contexts, start=1)
         }
 
-        # 7. NLI Auditing and Adjudication
-        audit_report = self.adjudicator.adjudicate(
-            claims=claims,
-            context_map=context_map,
-            nli_verifier=self.nli_verifier,
-            draft_text=draft_text,
-        )
+        # 7. NLI Auditing and Adjudication (with fixed citation-to-premise routing)
+        with self.tracer.trace_step("NLI Verification", "src/pipeline_4_verification/adjudicator.py", "verify"):
+            audit_report = self.adjudicator.verify(
+                claims=claims,
+                context_map=context_map,
+                nli_verifier=self.nli_verifier,
+                draft_text=draft_text,
+                contexts=top_contexts,
+            )
 
         # 8. Automated Self-Correction Rewrite Loop (1-pass) with Selective Claim Pruning
         audit_report = self.corrector.correct(
@@ -800,6 +888,50 @@ class TrustRAGPipeline:
             default_section=default_section,
         )
 
+        # Check if corrected draft is an uninformative refusal response
+        if self.gap_detector.is_refusal_response(audit_report.draft_text):
+            with self.tracer.trace_step("Open-World Generation", "src/pipeline_3_generation/generator.py", "generate_open_world"):
+                open_world_draft = self.generator.generate_open_world(user_query)
+            audit_report = TrustAuditReport(
+                draft_text=open_world_draft,
+                faithfulness_score=0.0,
+                has_contradiction=False,
+                action="UNVERIFIED_OPEN_WORLD",
+                audits=[],
+                grounding_mode=GroundingMode.OPEN_WORLD_FALLBACK,
+                trust_score=0.0,
+                verdict="UNVERIFIED_OPEN_WORLD",
+                source_attribution="OPEN_WORLD_GENERAL_KNOWLEDGE",
+                gap_reason="CLOSED_WORLD_REFUSAL",
+            )
+            self.last_trace = self.tracer.get_trace()
+            return audit_report
+
+        # 9. Enrich Audit Report with Exact Provenance Lineage Coordinates
+        provenance_map: Dict[str, ProvenanceCoordinate] = {}
+        for idx, context in enumerate(top_contexts, start=1):
+            doc_key = f"Doc-{idx}"
+            if hasattr(context, "provenance") and context.provenance is not None:
+                provenance_map[doc_key] = context.provenance
+            else:
+                provenance_map[doc_key] = ProvenanceCoordinate(
+                    doc_id=context.doc_id,
+                    source_type="pdf" if getattr(context, "bbox", None) else "text",
+                    page=context.page_number,
+                    section_name=context.section_name,
+                    bbox=getattr(context, "bbox", None),
+                    snippet=context.text[:200] if context.text else None,
+                )
+        audit_report.provenance_map = provenance_map
+
+        # 10. Record Closed-World Grounding State and Trust Metrics
+        audit_report.grounding_mode = GroundingMode.CLOSED_WORLD
+        audit_report.trust_score = audit_report.faithfulness_score
+        audit_report.verdict = audit_report.action
+        audit_report.source_attribution = "DOCUMENT_VAULT"
+        audit_report.gap_reason = "SUFFICIENT_EVIDENCE"
+
+        self.last_trace = self.tracer.get_trace()
         return audit_report
 
     def chat(

@@ -59,7 +59,7 @@ import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.common.config import config
-from src.common.schemas import ChildChunk, ParentChunk
+from src.common.schemas import ChildChunk, ParentChunk, ProvenanceCoordinate
 
 
 def _count_words_chunk(text: str) -> int:
@@ -360,6 +360,8 @@ def create_hierarchical_chunks(
     current_buffer: List[str] = []
     current_buffer_len = 0
 
+    page_meta_map: Dict[int, Dict[str, Any]] = {int(p.get("page_number", 1)): p for p in pages}
+
     def _count_words(text: str) -> int:
         clean = re.sub(r"^#+\s*", "", text.strip())
         return len(clean.split())
@@ -385,19 +387,78 @@ def create_hierarchical_chunks(
 
         word_cnt = _count_words(raw_parent_body)
 
+        # Lookup page metadata for bounding box resolution
+        page_info = page_meta_map.get(page_num, {})
+        page_lines = page_info.get("lines") or []
+        page_bbox = page_info.get("bbox")
+
+        # Determine bounding box for raw_parent_body
+        matched_parent_lines = [
+            l for l in page_lines
+            if l.get("text") and (l["text"] in raw_parent_body or any(w in raw_parent_body for w in l["text"].split() if len(w) > 4))
+        ] if page_lines else []
+
+        if matched_parent_lines:
+            parent_bbox = [
+                round(min(l["bbox"][0] for l in matched_parent_lines), 2),
+                round(min(l["bbox"][1] for l in matched_parent_lines), 2),
+                round(max(l["bbox"][2] for l in matched_parent_lines), 2),
+                round(max(l["bbox"][3] for l in matched_parent_lines), 2),
+            ]
+        else:
+            parent_bbox = page_bbox
+
+        is_pdf = bool(page_bbox or parent_bbox)
+        page_bc = page_info.get("breadcrumb", "")
+        page_sec = page_info.get("section_name", "")
+        effective_section = page_sec or section_name
+
+        if page_info.get("metadata", {}).get("format") or page_info.get("metadata", {}).get("has_ocr") is not None:
+            source_type = "image"
+        elif is_pdf:
+            source_type = "pdf"
+        else:
+            source_type = "text"
+
         # Minimum chunk size threshold: 15 words
         if word_cnt < 15:
             if parent_chunks:
                 # Merge into preceding parent chunk and child chunk
                 parent_chunks[-1].text = f"{parent_chunks[-1].text}\n{raw_parent_body}"
                 child_chunks[-1].text = f"{child_chunks[-1].text}\n{raw_parent_body}"
+                if parent_chunks[-1].bbox and parent_bbox:
+                    merged_p_bbox = [
+                        round(min(parent_chunks[-1].bbox[0], parent_bbox[0]), 2),
+                        round(min(parent_chunks[-1].bbox[1], parent_bbox[1]), 2),
+                        round(max(parent_chunks[-1].bbox[2], parent_bbox[2]), 2),
+                        round(max(parent_chunks[-1].bbox[3], parent_bbox[3]), 2),
+                    ]
+                    parent_chunks[-1].bbox = merged_p_bbox
+                    if parent_chunks[-1].provenance:
+                        parent_chunks[-1].provenance = parent_chunks[-1].provenance.model_copy(update={"bbox": merged_p_bbox})
                 return True
             elif not is_final:
                 # Carry forward into next buffer
                 return False
             # If is_final and no prior parent_chunks, emit single sole document chunk below
 
-        breadcrumb = f"[Document: {doc_id} | Section: {section_name}]"
+        parent_prov = ProvenanceCoordinate(
+            doc_id=doc_id,
+            source_type=source_type,
+            page=page_num,
+            section_name=effective_section,
+            bbox=parent_bbox,
+            snippet=raw_parent_body[:200],
+        )
+
+        if page_bc:
+            clean_bc = page_bc.strip("[]")
+            breadcrumb = f"[Document: {doc_id} | {clean_bc}]"
+            inlined_child_prefix = f"[{clean_bc}] "
+        else:
+            breadcrumb = f"[Document: {doc_id} | Section: {effective_section}]"
+            inlined_child_prefix = f"[Section: {effective_section}] "
+
         parent_text = f"{breadcrumb}\n{raw_parent_body}"
         parent_id = f"{doc_id}_p{page_num}_{doc_parent_index}"
         parent_child_ids: List[str] = []
@@ -422,7 +483,31 @@ def create_hierarchical_chunks(
             child_id = f"{parent_id}_c{doc_child_index}"
             parent_child_ids.append(child_id)
 
-            inlined_child_text = f"[Section: {section_name}] {c_text}"
+            matched_child_lines = [
+                l for l in page_lines
+                if l.get("text") and (l["text"] in c_text or any(w in c_text for w in l["text"].split() if len(w) > 4))
+            ] if page_lines else []
+
+            if matched_child_lines:
+                child_bbox = [
+                    round(min(l["bbox"][0] for l in matched_child_lines), 2),
+                    round(min(l["bbox"][1] for l in matched_child_lines), 2),
+                    round(max(l["bbox"][2] for l in matched_child_lines), 2),
+                    round(max(l["bbox"][3] for l in matched_child_lines), 2),
+                ]
+            else:
+                child_bbox = parent_bbox
+
+            child_prov = ProvenanceCoordinate(
+                doc_id=doc_id,
+                source_type=source_type,
+                page=page_num,
+                section_name=effective_section,
+                bbox=child_bbox,
+                snippet=c_text[:200],
+            )
+
+            inlined_child_text = f"{inlined_child_prefix}{c_text}"
             child_chunk = ChildChunk(
                 chunk_id=child_id,
                 parent_id=parent_id,
@@ -432,7 +517,9 @@ def create_hierarchical_chunks(
                 sparse_tokens=None,
                 page_number=page_num,
                 chunk_index=doc_child_index,
-                section_name=section_name,
+                section_name=effective_section,
+                bbox=child_bbox,
+                provenance=child_prov,
             )
             child_chunks.append(child_chunk)
             doc_child_index += 1
@@ -444,7 +531,9 @@ def create_hierarchical_chunks(
             page_number=page_num,
             child_ids=parent_child_ids,
             chunk_index=doc_parent_index,
-            section_name=section_name,
+            section_name=effective_section,
+            bbox=parent_bbox,
+            provenance=parent_prov,
         )
         parent_chunks.append(parent_chunk)
         doc_parent_index += 1
@@ -454,6 +543,9 @@ def create_hierarchical_chunks(
 
     for page in pages:
         current_page_num = int(page.get("page_number", 1))
+        page_toc_sec = page.get("section_name")
+        if page_toc_sec and page_toc_sec != "General" and current_section == "General":
+            current_section = page_toc_sec
         raw_text = page.get("raw_text") or page.get("text", "")
         if not raw_text:
             continue

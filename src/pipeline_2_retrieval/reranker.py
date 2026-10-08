@@ -87,6 +87,71 @@ class CrossEncoderReranker:
         self.device = device or get_optimal_device()
         self.model = CrossEncoder(self.model_name, device=self.device)
 
+    def rerank(
+        self,
+        query: str,
+        candidates: List[Any],
+        top_k: int = config.retrieval.top_k_rerank,
+        score_cutoff: Optional[float] = None,
+    ) -> List[Any]:
+        """Rerank candidate chunks or passages with soft-floor score resilience.
+
+        Prevents returning an empty list when candidates were passed in from retrieval.
+        If all raw logit scores fall below the default cutoff, returns the top-K
+        highest-scoring candidates as a fallback instead of truncating to 0.
+
+        Args:
+            query: Search query string.
+            candidates: List of candidate objects (RetrievalCandidate, ChildChunk, ParentChunk,
+                        dict, or tuple/string).
+            top_k: Maximum number of top candidates to return.
+            score_cutoff: Optional minimum score threshold. If all scores fall below
+                          this threshold, top-k candidates are preserved as a fallback.
+
+        Returns:
+            List of reranked candidate objects sorted descending by score.
+        """
+        if not query or not candidates:
+            return []
+
+        # Extract text for each candidate
+        pairs = []
+        for c in candidates:
+            if hasattr(c, "text"):
+                c_text = c.text
+            elif isinstance(c, dict):
+                c_text = c.get("text", str(c))
+            elif isinstance(c, (tuple, list)) and len(c) >= 2:
+                c_text = str(c[1])
+            else:
+                c_text = str(c)
+            pairs.append([query, c_text])
+
+        raw_scores = self.model.predict(pairs, show_progress_bar=False)
+
+        scored = []
+        for c, s in zip(candidates, raw_scores):
+            score_val = float(s)
+            if hasattr(c, "score"):
+                try:
+                    c.score = score_val
+                except Exception:
+                    pass
+            scored.append((c, score_val))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        cutoff = score_cutoff if score_cutoff is not None else getattr(config.retrieval, "reranker_score_cutoff", None)
+
+        if cutoff is not None:
+            filtered = [item for item in scored if item[1] >= cutoff]
+            if filtered:
+                return [item[0] for item in filtered[:top_k]]
+            # Soft floor fallback: preserve top-K highest scoring candidates even if below cutoff
+            return [item[0] for item in scored[:top_k]]
+
+        return [item[0] for item in scored[:top_k]]
+
     def rerank_and_resolve(
         self,
         query: str,
@@ -99,6 +164,7 @@ class CrossEncoderReranker:
         is_comparative: Optional[bool] = None,
         user_id: Optional[str] = None,
         thread_id: Optional[str] = None,
+        score_cutoff: Optional[float] = None,
     ) -> List[RetrievalCandidate]:
         """Rerank candidate children, expand adjacent parent neighbors, and return top context passages.
 
@@ -185,13 +251,32 @@ class CrossEncoderReranker:
                         score=group_score,
                         match_type="cross_encoder_reranked",
                         chunk_index=single.chunk_index,
+                        section_name=getattr(single, "section_name", "General"),
                         user_id=getattr(single, "user_id", None),
                         thread_id=getattr(single, "thread_id", None),
+                        bbox=getattr(single, "bbox", None),
+                        provenance=getattr(single, "provenance", None),
                     )
                 else:
                     combined_text = "\n\n".join(p.text for p in group_parents)
                     combined_id = "+".join(p.parent_id for p in group_parents)
                     first_p = group_parents[0]
+
+                    bboxes = [p.bbox for p in group_parents if getattr(p, "bbox", None)]
+                    merged_bbox = (
+                        [
+                            round(min(b[0] for b in bboxes), 2),
+                            round(min(b[1] for b in bboxes), 2),
+                            round(max(b[2] for b in bboxes), 2),
+                            round(max(b[3] for b in bboxes), 2),
+                        ]
+                        if bboxes
+                        else None
+                    )
+                    prov = getattr(first_p, "provenance", None)
+                    if prov and merged_bbox:
+                        prov = prov.model_copy(update={"bbox": merged_bbox})
+
                     candidate = RetrievalCandidate(
                         parent_id=combined_id,
                         doc_id=first_p.doc_id,
@@ -200,15 +285,20 @@ class CrossEncoderReranker:
                         score=group_score,
                         match_type="cross_encoder_neighbor_expanded",
                         chunk_index=first_p.chunk_index,
+                        section_name=getattr(first_p, "section_name", "General"),
                         user_id=getattr(first_p, "user_id", None),
                         thread_id=getattr(first_p, "thread_id", None),
+                        bbox=merged_bbox,
+                        provenance=prov,
                     )
                 expanded_candidates.append(candidate)
 
         if user_id is not None:
-            expanded_candidates = [c for c in expanded_candidates if getattr(c, "user_id", None) == user_id]
-        if thread_id is not None:
-            expanded_candidates = [c for c in expanded_candidates if getattr(c, "thread_id", None) == thread_id]
+            expanded_candidates = [
+                c for c in expanded_candidates
+                if getattr(c, "user_id", None) is None or getattr(c, "user_id", None) == user_id
+            ]
+        # Note: Do not restrict document chunk retrieval to a specific thread_id
 
         # Sort all candidates descending by cross-encoder relevance score
         expanded_candidates.sort(key=lambda x: x.score, reverse=True)
@@ -258,6 +348,16 @@ class CrossEncoderReranker:
                         break
                     selected.append(cand)
 
-            return selected
+            final_candidates = selected
+        else:
+            final_candidates = expanded_candidates[:top_k]
 
-        return expanded_candidates[:top_k]
+        cutoff = score_cutoff if score_cutoff is not None else getattr(config.retrieval, "reranker_score_cutoff", None)
+        if cutoff is not None:
+            filtered = [c for c in final_candidates if c.score >= cutoff]
+            if filtered:
+                return filtered
+            # Soft floor fallback: preserve top-K candidates if all scores fell below cutoff
+            return final_candidates
+
+        return final_candidates

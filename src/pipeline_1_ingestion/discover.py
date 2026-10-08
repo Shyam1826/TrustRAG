@@ -46,6 +46,9 @@ READER_REGISTRY: Dict[str, Callable] = {
     ".csv": read_document,
     ".txt": read_document,
     ".md": read_document,
+    ".jpg": read_document,
+    ".jpeg": read_document,
+    ".png": read_document,
 }
 
 
@@ -90,18 +93,26 @@ def discover_raw_documents(
         except ValueError:
             rel_path = Path(file_path.name)
 
-        # Ignore hidden system files and hidden directory segments
+        # Ignore hidden system files, caches, and database directories
         if any(part.startswith(".") for part in rel_path.parts):
+            continue
+        if any(part in ("qdrant_db", "__pycache__", ".venv", "tests") for part in rel_path.parts):
             continue
 
         if file_path.suffix.lower() not in exts:
             continue
 
+        # Strip 'raw' root segment if scanning from data base directory to maintain manifest compatibility
+        if rel_path.parts and rel_path.parts[0] == "raw" and len(rel_path.parts) > 1:
+            rel_for_doc = Path(*rel_path.parts[1:])
+        else:
+            rel_for_doc = rel_path
+
         # Derive clean, collision-safe doc_id (e.g., "operations/SLA_Classifications_Template")
-        rel_str = str(rel_path).replace("\\", "/")
-        rel_stem_str = str(rel_path.with_suffix("")).replace("\\", "/")
+        rel_str = str(rel_for_doc).replace("\\", "/")
+        rel_stem_str = str(rel_for_doc.with_suffix("")).replace("\\", "/")
         doc_id = rel_stem_str
-        folder_hierarchy = [p for p in rel_path.parent.parts if p and p != "."]
+        folder_hierarchy = [p for p in rel_for_doc.parent.parts if p and p != "."]
 
         discovered.append((file_path, doc_id, rel_str, folder_hierarchy))
 

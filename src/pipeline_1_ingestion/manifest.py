@@ -3,10 +3,10 @@ r"""
 1. PURPOSE & ROLE:
    - Module: src/pipeline_1_ingestion/manifest.py
    - Role: Incremental idempotent ingestion manifest and file fingerprinting engine.
-   - Purpose: Tracks document indexing state on disk using streaming SHA-256 hashing
-     and byte-size verification. Prevents redundant re-parsing and embedding of unchanged
-     files during startup scans, detects modified files for re-indexing, and removes deleted
-     documents.
+   - Purpose: Tracks document indexing state on disk using streaming SHA-256 hashing,
+     byte-size verification, and parser version hashing. Prevents redundant re-parsing
+     and embedding of unchanged files during startup scans, invalidates cache and triggers
+     clean re-indexing when the parser logic or schema changes, and prunes deleted documents.
 
 2. INPUT (IP):
    - path (Path | str): Target document file path.
@@ -15,12 +15,14 @@ r"""
    - manifest_path (Path | str, optional): Persistent JSON manifest storage path.
 
 3. PROCESS UNDER THE HOOD:
-   - Manages persistent JSON state at `data/ingestion_manifest.json` (or configured path).
+   - Manages persistent JSON state at `data/processed/ingestion_manifest.json` (or configured path).
+   - Tracks `PARSER_VERSION` ("2.2.0"): invalidates cache automatically when parser schema evolves.
    - Computes streaming SHA-256 hash using 64KB block iterations (`65536` bytes).
    - `is_indexed_and_current()`: Validates whether `doc_id` exists in manifest with
-     identical byte size and SHA-256 hash.
-   - `record_indexed()`: Records document fingerprint, chunk count, timestamp, and metadata.
+     identical byte size, SHA-256 hash, and current parser version.
+   - `record_indexed()`: Records document fingerprint, chunk count, parser version, timestamp, and metadata.
    - `remove_entry()`: Deletes document record from manifest and persists state.
+   - `invalidate()`: Purges cached entries and resets manifest file on disk.
    - `prune_missing_files()`: Identifies and removes deleted document entries.
 
 4. OUTPUT (OP):
@@ -50,6 +52,8 @@ from src.common.config import config
 class IngestionManifest:
     """Manages persistent SHA-256 document indexing registry to ensure idempotent ingestion."""
 
+    PARSER_VERSION: str = "2.2.0"
+
     def __init__(self, manifest_path: Optional[Union[str, Path]] = None) -> None:
         """Initialize the ingestion manifest.
 
@@ -62,12 +66,20 @@ class IngestionManifest:
         self._load()
 
     def _load(self) -> None:
-        """Load manifest data from disk if file exists."""
+        """Load manifest data from disk if file exists and validate parser version."""
         if self.manifest_path.is_file():
             try:
                 with open(self.manifest_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
+                        manifest_parser_ver = data.get("parser_version")
+                        if manifest_parser_ver and manifest_parser_ver != self.PARSER_VERSION:
+                            print(
+                                f"[Manifest] Notice: Parser version changed ({manifest_parser_ver} -> {self.PARSER_VERSION}). "
+                                f"Invalidating cache to force fresh re-indexing."
+                            )
+                            self.entries = {}
+                            return
                         self.entries = data.get("documents", data)
             except Exception as e:
                 print(f"[Manifest] Warning: Failed to read manifest ({e}). Starting fresh.")
@@ -81,6 +93,7 @@ class IngestionManifest:
             self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "version": "1.0",
+                "parser_version": self.PARSER_VERSION,
                 "last_updated": datetime.now(timezone.utc).isoformat(),
                 "documents": self.entries,
             }
@@ -90,6 +103,15 @@ class IngestionManifest:
             os.replace(temp_path, self.manifest_path)
         except Exception as e:
             print(f"[Manifest] Error saving manifest: {e}")
+
+    def invalidate(self) -> None:
+        """Clear in-memory entries and remove manifest file on disk."""
+        self.entries.clear()
+        if self.manifest_path.is_file():
+            try:
+                self.manifest_path.unlink()
+            except Exception as e:
+                print(f"[Manifest] Warning: Failed to delete manifest file: {e}")
 
     @staticmethod
     def compute_file_hash(path: Union[str, Path]) -> str:
@@ -132,6 +154,9 @@ class IngestionManifest:
         if current_size != recorded_size:
             return False
 
+        if entry.get("parser_version") and entry.get("parser_version") != self.PARSER_VERSION:
+            return False
+
         current_hash = self.compute_file_hash(p)
         recorded_hash = entry.get("sha256")
         return current_hash == recorded_hash
@@ -161,10 +186,12 @@ class IngestionManifest:
             "size_bytes": file_size,
             "sha256": file_hash,
             "chunk_count": chunk_count,
+            "parser_version": self.PARSER_VERSION,
             "indexed_at": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
         }
         self._save()
+
 
     def remove_entry(self, doc_id: str) -> None:
         """Remove a document entry from the manifest.

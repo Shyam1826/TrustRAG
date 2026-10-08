@@ -2,37 +2,33 @@ r"""
 ================================================================================
 1. PURPOSE & ROLE:
    - Module: src/pipeline_3_generation/generator.py
-   - Role: Multi-provider synthesis and generation engine with automatic rate-limit resilience.
+   - Role: Multi-provider synthesis, closed-world generation, and open-world fallback engine.
    - Purpose: Dispatches structured RAG prompts to cloud API providers (Groq, Gemini),
      local transformers (HuggingFace), or offline deterministic mocks with graceful
-     credential fallback. Implements exponential/adaptive backoff retry loops on HTTP 429
-     (Rate Limit / TPM Exceeded) to ensure multi-turn self-correction completes reliably.
+     credential fallback. Provides dual-mode generation capabilities: closed-world
+     vault-grounded answer generation with strict citation constraints, and open-world
+     parametric answer generation with standardized enterprise disclaimers. Implements
+     exponential/adaptive backoff retry loops on HTTP 429 rate limits.
 
 2. INPUT (IP):
    - prompt (str): Formatted RAG prompt containing XML context from `src/pipeline_3_generation/prompt.py`.
+   - query (str): Natural language user inquiry for open-world fallback generation.
 
 3. PROCESS UNDER THE HOOD:
-   - BaseGenerator: Abstract Base Class defining standard `generate(prompt: str) -> str`.
+   - BaseGenerator: Abstract Base Class defining `generate()`, `generate_answer()`, and `generate_open_world()`.
+   - OPEN_WORLD_DISCLAIMER: Standardized enterprise notice prepended to parametric fallback responses.
    - GroqGenerator:
-     * Dispatches HTTP POST to `https://api.groq.com/openai/v1/chat/completions`.
-     * Passes system instructions enforcing closed-world rules and inline [Doc-X] citations.
-     * Enforces `temperature=0.0` for deterministic, grounded outputs.
-     * Catches HTTP 429 errors, parses recommended wait time from JSON body, and sleeps
-       automatically for up to `max_retries=3`.
-   - GeminiGenerator:
-     * Dispatches HTTP POST to Google Generative Language API (`/v1beta/models/{model}:generateContent`).
-     * Sets `temperature=0.0`.
-     * Includes retry backoff on 429 quota exhaustion.
+     * Closed-World: temperature=0.0, system prompt enforcing strict XML document groundings and [Doc-X] tags.
+     * Open-World: temperature=0.2, instructs model to answer using general knowledge without citations.
+     * Adaptive HTTP 429 retry backoff parsing exact retry durations.
    - MockGenerator:
-     * Offline deterministic rule-based generator for testing without cloud credentials.
-   - get_generator:
-     * Inspects `config.GENERATOR_PROVIDER` or explicit provider argument.
-     * Checks for required API keys; if missing, logs a descriptive notice and falls back
-       gracefully to `MockGenerator`.
+     * Deterministic offline mock for test suites and credential-free evaluation.
+     * Supports both closed-world rule-based synthesis and open-world disclaimed generation.
+   - get_generator(): Factory creating configured active generator with automatic fallback to mock.
 
 4. OUTPUT (OP):
-   - str: Synthesized draft response containing inline citations.
-   - Consumed by: `src/pipeline_3_generation/citation_check.py` and `src/pipeline_4_verification/`.
+   - str: Synthesized answer string (closed-world with [Doc-X] tags or open-world with enterprise disclaimer).
+   - Consumed by: `src/main.py` (TrustRAGPipeline) and downstream verification pipelines.
 
 5. LIBRARIES & DEPENDENCIES:
    - urllib.request, urllib.error, json, time, re: Standard library HTTP client, timing, and parsing.
@@ -53,6 +49,59 @@ from src.common.config import config
 from src.pipeline_3_generation.prompt import FALLBACK_INSUFFICIENT_INFO
 
 
+def deduplicate_sentences(text: str, overlap_threshold: float = 0.9) -> str:
+    """Discard identical or near-duplicate sentences/bullets (>0.9 lexical overlap) from generated text.
+
+    Args:
+        text: Raw generated response text.
+        overlap_threshold: Jaccard word-overlap ceiling (default 0.9).
+
+    Returns:
+        Deduplicated response text.
+    """
+    if not text or not text.strip():
+        return text
+
+    lines = text.split("\n")
+    deduped_lines: List[str] = []
+    seen_token_sets: List[set] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            deduped_lines.append(line)
+            continue
+
+        # Extract tokens for lexical comparison (excluding citations like [Doc-1])
+        clean_text = re.sub(r"\[Doc-\d+\]", "", stripped)
+        tokens = set(re.findall(r"\b[a-zA-Z0-9_]+\b", clean_text.lower()))
+
+        if not tokens:
+            deduped_lines.append(line)
+            continue
+
+        # Check against previously seen sentences
+        is_dup = False
+        for seen_tokens in seen_token_sets:
+            intersection = len(tokens & seen_tokens)
+            union = len(tokens | seen_tokens)
+            if union > 0 and (intersection / union) >= overlap_threshold:
+                is_dup = True
+                break
+
+        if not is_dup:
+            deduped_lines.append(line)
+            seen_token_sets.append(tokens)
+
+    return "\n".join(deduped_lines)
+
+
+OPEN_WORLD_DISCLAIMER = (
+    "⚠️ Notice: The provided documentation does not contain sufficient information to answer this inquiry. "
+    "The following response is generated using open-world general knowledge and is not verified against your document vault.\n\n"
+)
+
+
 class BaseGenerator(ABC):
     """Abstract interface for text generation models in TrustRAG."""
 
@@ -67,6 +116,35 @@ class BaseGenerator(ABC):
             Generated text string.
         """
         pass
+
+    def generate_answer(self, prompt: str) -> str:
+        """Generate response and deduplicate identical or near-duplicate sentences (>0.9 lexical overlap).
+
+        Args:
+            prompt: Formatted RAG prompt.
+
+        Returns:
+            Deduplicated generated response.
+        """
+        raw = self.generate(prompt)
+        return deduplicate_sentences(raw, overlap_threshold=0.9)
+
+    def generate_open_world(self, query: str) -> str:
+        """Generate open-world parametric answer with standardized enterprise disclaimer.
+
+        Args:
+            query: User search inquiry.
+
+        Returns:
+            Disclaimed open-world response string.
+        """
+        prompt = (
+            "You are an expert AI assistant. Answer the user inquiry clearly and concisely "
+            f"using general parametric knowledge. Do not reference or invent document citations like [Doc-X].\n\nQuestion: {query}"
+        )
+        raw = self.generate(prompt)
+        return f"{OPEN_WORLD_DISCLAIMER}{raw.strip()}"
+
 
 
 class GroqGenerator(BaseGenerator):
@@ -89,24 +167,8 @@ class GroqGenerator(BaseGenerator):
         if not self.api_key:
             raise ValueError("GROQ_API_KEY is required for GroqGenerator.")
 
-    def generate(self, prompt: str) -> str:
-        """Invoke Groq Chat Completions API with temperature=0.0 and adaptive 429 backoff."""
-        payload = {
-            "model": self.model_name,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an enterprise AI assistant adhering to strict verification standards. "
-                        "Answer strictly using ONLY the provided <context> documents and append inline [Doc-X] "
-                        "citation tags to every factual assertion."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.0,
-        }
-
+    def _send_payload(self, payload: dict) -> str:
+        """Send chat payload to Groq API with 429 adaptive retry."""
         data_bytes = json.dumps(payload).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -154,6 +216,45 @@ class GroqGenerator(BaseGenerator):
                 raise RuntimeError(f"Failed to communicate with Groq API: {e}") from e
 
         return FALLBACK_INSUFFICIENT_INFO
+
+    def generate(self, prompt: str) -> str:
+        """Invoke Groq Chat Completions API with temperature=0.0 and adaptive 429 backoff."""
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an enterprise AI assistant adhering to strict verification standards. "
+                        "Answer strictly using ONLY the provided <context> documents and append inline [Doc-X] "
+                        "citation tags to every factual assertion."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+        }
+        return self._send_payload(payload)
+
+    def generate_open_world(self, query: str) -> str:
+        """Invoke Groq Chat Completions API with open-world instructions and disclaimer."""
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert AI assistant. Answer the user inquiry accurately and concisely "
+                        "using general parametric knowledge. Do not reference or invent document citations like [Doc-X]."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            "temperature": 0.2,
+        }
+        raw_ans = self._send_payload(payload)
+        return f"{OPEN_WORLD_DISCLAIMER}{raw_ans.strip()}"
+
 
 
 class GeminiGenerator(BaseGenerator):
@@ -289,10 +390,49 @@ class MockGenerator(BaseGenerator):
                     lines.append(f"- Under the {name}, {attr_str} [{doc_handle}].")
 
             if lines:
-                return "\n".join(lines[:5])
+                return deduplicate_sentences("\n".join(lines[:5]))
+
+        # Dynamic narrative multi-attribute query extraction from context documents
+        docs = re.findall(
+            r'<document id="(?P<doc_id>Doc-\d+)"[^>]*>\s*(?P<doc_text>.*?)\s*</document>',
+            prompt,
+            re.DOTALL,
+        )
+        if docs:
+            q_match = re.search(r"User Question:\s*(.*?)(?:\n\n|\Z)", prompt, re.DOTALL)
+            q_words = set(re.findall(r"\b[a-zA-Z0-9_]{3,}\b", q_match.group(1).lower())) if q_match else set()
+
+            generated_bullets = []
+            for doc_handle, doc_text in docs:
+                clean_text = doc_text.strip()
+                raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", clean_text) if s.strip()]
+                for sent in raw_sentences:
+                    if sent.startswith("[Document:") or sent.startswith("##"):
+                        continue
+                    sent_clean = re.sub(r"\[(?:Document|Section|Sheet|Table):[^\]]+\]\s*", "", sent).strip()
+                    if not sent_clean or len(sent_clean) < 15:
+                        continue
+                    sent_words = set(re.findall(r"\b[a-zA-Z0-9_]{3,}\b", sent_clean.lower()))
+                    if not q_words or (sent_words & q_words):
+                        bullet = f"{sent_clean.rstrip('.')} [{doc_handle}]."
+                        generated_bullets.append(bullet)
+                        if len(generated_bullets) >= 4:
+                            break
+                if len(generated_bullets) >= 4:
+                    break
+
+            if generated_bullets:
+                return deduplicate_sentences("\n".join(generated_bullets))
 
         # Fallback for insufficient context
         return FALLBACK_INSUFFICIENT_INFO
+
+    def generate_open_world(self, query: str) -> str:
+        """Generate deterministic open-world response with standard disclaimer for offline evaluation."""
+        clean_q = query.strip().rstrip("?")
+        body = f"Based on general world knowledge, {clean_q} is addressed using parametric facts and domain principles."
+        return f"{OPEN_WORLD_DISCLAIMER}{body}"
+
 
 
 class LocalHFGenerator(BaseGenerator):
@@ -349,3 +489,22 @@ def get_generator(generator_type: Optional[str] = None) -> BaseGenerator:
         return LocalHFGenerator()
 
     return MockGenerator()
+
+
+def generate_answer(generator: BaseGenerator, prompt: str) -> str:
+    """Generate answer from prompt with multi-attribute coverage and post-generation deduplication."""
+    return generator.generate_answer(prompt)
+
+
+def correct_unverified_claims(
+    generator: BaseGenerator,
+    correction_prompt: str,
+) -> str:
+    """Execute corrective rewrite with multi-attribute coverage and sentence deduplication."""
+    return generator.generate_answer(correction_prompt)
+
+
+def generate_open_world(query: str, generator: Optional[BaseGenerator] = None) -> str:
+    """Direct the LLM to answer using general parametric knowledge with standard disclaimer."""
+    gen = generator if generator is not None else get_generator()
+    return gen.generate_open_world(query)

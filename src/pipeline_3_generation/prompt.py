@@ -117,6 +117,8 @@ def build_rag_prompt(
         "     * If a requested entity category has only one matching item in the text, report only that single item.\n"
         "4. (Structured Atomic Bullets & Verbatim Source Fidelity):\n"
         "   - Exhaustively list all relevant facts, specifications, items, or properties mentioned in <context>.\n"
+        "   - Multi-Attribute Coverage: When the user question seeks multiple attributes (such as names, numbers, ratios, formulas, categories, or metrics), address all identified target components explicitly, completely, and concisely without omitting any requested attribute.\n"
+        "   - Deduplication: Do not output duplicate or near-identical sentences or assertions.\n"
         "   - Format each distinct fact as a concise bullet point, reproducing names and explicit details directly from <context>.\n"
         "   - Complete Sentence Structure: Formulate every assertion as a complete, self-contained grammatical sentence connecting entity and attribute (e.g., write 'The application located in Tokyo is Quantum Sim_9254 [Doc-1].' rather than isolated key-value fragments like 'Application Name: Quantum Sim_9254 [Doc-1]').\n"
         "   - If an item in <context> is listed only as a title, name, or short phrase, output ONLY that title or phrase verbatim (e.g. `- Item Name [Doc-1]`). Do NOT invent parenthetical explanations, definitions, or ungrounded commentary.\n"
